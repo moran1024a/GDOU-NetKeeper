@@ -16,6 +16,28 @@ const PROBE_TIMEOUT: Duration = Duration::from_millis(1500);
 const MAX_BODY: usize = 64 * 1024;
 const PROBE_URL: &str = "http://www.msftconnecttest.com/connecttest.txt";
 
+#[derive(Debug)]
+pub struct CredentialRejected(String);
+
+impl std::fmt::Display for CredentialRejected {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for CredentialRejected {}
+
+fn rejection(value: &Value, config: &Config, secrets: &[String]) -> anyhow::Error {
+    let detail = portal_error(value, config, secrets);
+    // Only explicit, known account errors pause authentication. Unknown server
+    // errors remain retryable; free-form messages are never used to guess.
+    match value["error"].as_str().unwrap_or_default() {
+        "password_error" | "username_error" | "user_not_exist" | "user_disabled"
+        | "account_disabled" => CredentialRejected(detail).into(),
+        _ => anyhow::anyhow!(detail),
+    }
+}
+
 pub struct SrunClient<'a> {
     config: &'a Config,
     http: Client,
@@ -102,10 +124,7 @@ impl<'a> SrunClient<'a> {
             )
             .await?;
         if challenge.get("error").is_some_and(|v| v != "ok" && v != "") {
-            bail!(
-                "Challenge 请求被拒绝：{}",
-                portal_error(&challenge, self.config, &[])
-            );
+            return Err(rejection(&challenge, self.config, &[]).context("Challenge 请求被拒绝"));
         }
         let token = challenge["challenge"]
             .as_str()
@@ -144,10 +163,7 @@ impl<'a> SrunClient<'a> {
             )
             .await?;
         if response["error"] != "ok" {
-            bail!(
-                "Portal 拒绝登录：{}",
-                portal_error(&response, self.config, &secrets)
-            );
+            return Err(rejection(&response, self.config, &secrets).context("Portal 拒绝登录"));
         }
         Ok(())
     }
@@ -270,6 +286,9 @@ mod tests {
         assert!(detail.contains("password_error") && detail.contains("ecode=42"));
         assert!(!detail.contains(&config.password) && !detail.contains(&config.username));
         assert!(!detail.contains('\u{1b}'));
+        assert!(rejection(&value, &config, &[]).is::<CredentialRejected>());
+        let unknown = serde_json::json!({"error": "unknown", "error_msg": "password_error"});
+        assert!(!rejection(&unknown, &config, &[]).is::<CredentialRejected>());
         requests(server).await;
     }
 
@@ -314,9 +333,7 @@ mod tests {
             password: "p+&=/密".into(),
             portal_url: format!("http://{addr}"),
             ac_id: 17,
-            interface: None,
-            online_interval_secs: 60,
-            retry_interval_secs: 15,
+            ..Config::default()
         };
         (config, server)
     }

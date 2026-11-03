@@ -1,6 +1,7 @@
 use crate::{
-    client::SrunClient,
+    client::{CredentialRejected, SrunClient},
     config::Config,
+    probe,
     state::{Phase, State},
 };
 use anyhow::{bail, Context, Result};
@@ -15,7 +16,10 @@ use std::{
     path::Path,
     time::Duration,
 };
-use tokio::signal::unix::{signal, SignalKind};
+use tokio::{
+    signal::unix::{signal, SignalKind},
+    time::{Instant, MissedTickBehavior},
+};
 
 pub const START_TIMEOUT: Duration = Duration::from_secs(30);
 pub const START_FAILED: u8 = 78;
@@ -96,40 +100,108 @@ pub async fn run(config_path: &Path, directory: &Path) -> Result<()> {
     report(&mut state, directory, Phase::Online, "已确认在线")?;
     notify("READY=1")?;
 
-    let mut online = true;
+    let interval = Duration::from_secs(config.probe.interval_secs);
+    let mut probes = tokio::time::interval_at(Instant::now() + interval, interval);
+    probes.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    let mut portal_due = Instant::now() + Duration::from_secs(config.online_interval_secs);
+    let mut retry_due = None;
     loop {
-        let interval = if online {
-            config.online_interval_secs
-        } else {
-            config.retry_interval_secs
-        };
-        tokio::select! {
+        let recovering = retry_due.is_some();
+        let paused = state.phase == Phase::Paused;
+        let deadline = retry_due.unwrap_or(portal_due);
+        // One event loop serializes all work. During recovery only the retry
+        // deadline can trigger network I/O; signals cannot bypass backoff.
+        let check_probe = tokio::select! {
             biased;
             _ = &mut shutdown => break,
-            _ = refresh.recv() => {},
-            _ = tokio::time::sleep(Duration::from_secs(interval)) => {}
+            _ = refresh.recv() => {
+                if recovering || paused {
+                    let phase = state.phase;
+                    let detail = state.detail.clone();
+                    report(&mut state, directory, phase, &detail)?;
+                    continue;
+                }
+                false
+            },
+            _ = tokio::time::sleep_until(deadline), if !paused => false,
+            _ = probes.tick(), if !recovering && !paused => true,
+        };
+        if check_probe {
+            let result = tokio::select! {
+                biased;
+                _ = &mut shutdown => break,
+                result = probe::check(&config) => result,
+            };
+            record_probe(&mut state, result);
+            state.save(directory)?;
+            if state.probe_failures < config.probe.failure_threshold {
+                continue;
+            }
         }
+
         let result = tokio::select! {
             biased;
             _ = &mut shutdown => break,
             result = cycle(&config) => result,
         };
+        // If probes triggered recovery, Portal's online flag alone must not
+        // reset the outage: verify the public path after the authentication.
+        let result = if result.is_ok()
+            && (recovering || state.probe_failures >= config.probe.failure_threshold)
+        {
+            let probe = tokio::select! {
+                biased;
+                _ = &mut shutdown => break,
+                result = probe::check(&config) => result,
+            };
+            let reachable = probe.reachable;
+            record_probe(&mut state, probe);
+            if reachable {
+                Ok(())
+            } else {
+                Err(anyhow::anyhow!(
+                    "Portal 报告在线，但公网探测仍失败；不会重复登录，等待复查"
+                ))
+            }
+        } else {
+            result
+        };
+
+        probes.reset();
         match result {
             Ok(()) => {
-                online = true;
+                state.recovery_attempts = 0;
+                state.next_retry_at = None;
+                retry_due = None;
+                portal_due = Instant::now() + Duration::from_secs(config.online_interval_secs);
                 report(&mut state, directory, Phase::Online, "已确认在线")?;
             }
             Err(error) => {
-                online = false;
-                report(
-                    &mut state,
-                    directory,
-                    Phase::Retrying,
-                    &format!("等待重试：{error:#}"),
-                )?;
+                state.recovery_attempts = state.recovery_attempts.saturating_add(1);
+                if error.downcast_ref::<CredentialRejected>().is_some() {
+                    retry_due = None;
+                    state.next_retry_at = None;
+                    report(
+                        &mut state,
+                        directory,
+                        Phase::Paused,
+                        &format!("认证已暂停：{error:#}；请修改配置并重启服务"),
+                    )?;
+                } else {
+                    let delay = retry_delay(&config, state.recovery_attempts);
+                    retry_due = Some(Instant::now() + Duration::from_secs(delay));
+                    state.next_retry_at = Some(crate::state::now() + delay);
+                    report(
+                        &mut state,
+                        directory,
+                        Phase::Retrying,
+                        &format!("等待重试（{delay} 秒）：{error:#}"),
+                    )?;
+                }
             }
         }
     }
+    state.next_retry_at = None;
     report(
         &mut state,
         directory,
@@ -145,4 +217,50 @@ async fn cycle(config: &Config) -> Result<()> {
         bail!("登录已被接受，但尚未确认在线");
     }
     Ok(())
+}
+
+fn record_probe(state: &mut State, probe: probe::ProbeResult) {
+    state.probe_failures = if probe.reachable {
+        0
+    } else {
+        state.probe_failures.saturating_add(1)
+    };
+    state.probe = Some(probe);
+}
+
+fn retry_delay(config: &Config, failed_attempts: u32) -> u64 {
+    let stage = match failed_attempts {
+        0..=3 => 0,
+        4..=6 => 1,
+        _ => 2,
+    };
+    config.retry_intervals_secs[stage]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn staged_delays_and_probe_success_reset() {
+        let config = Config::default();
+        let delays: Vec<_> = (1..=9).map(|n| retry_delay(&config, n)).collect();
+        assert_eq!(delays, [5, 5, 5, 15, 15, 15, 30, 30, 30]);
+        let mut state = State::new(None);
+        for reachable in [false, false, true, false, false, false] {
+            record_probe(
+                &mut state,
+                probe::ProbeResult {
+                    checked_at: 0,
+                    reachable,
+                    detail: String::new(),
+                },
+            );
+        }
+        assert_eq!(state.probe_failures, 3);
+        assert_eq!(
+            state.generation, 0,
+            "Probe results cannot satisfy a start confirmation"
+        );
+    }
 }

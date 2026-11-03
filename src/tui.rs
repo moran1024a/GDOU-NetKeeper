@@ -1,4 +1,4 @@
-use crate::config::Config;
+use crate::config::{Config, ProbeMode};
 use anyhow::{ensure, Context, Result};
 use crossterm::{
     cursor::{Hide, MoveTo, Show},
@@ -325,8 +325,9 @@ pub fn settings(path: &Path) -> Result<bool> {
             format!("密码：{}", config.password),
             format!("Portal：{}", config.portal_url),
             format!("接入点 ac_id：{}", config.ac_id),
-            format!("在线巡检间隔（秒）：{}", config.online_interval_secs),
-            format!("失败重试间隔（秒）：{}", config.retry_interval_secs),
+            format!("Portal 巡检间隔（秒）：{}", config.online_interval_secs),
+            "公网探测设置".into(),
+            "分阶段重试设置".into(),
             "保存配置".into(),
             "取消".into(),
         ];
@@ -340,7 +341,7 @@ pub fn settings(path: &Path) -> Result<bool> {
                     config.interface = value;
                 }
             }
-            1..=6 => {
+            1..=5 => {
                 let (label, value) = choices[index].split_once('：').expect("field label");
                 if let Some(value) = ui.input(label, value)? {
                     match index {
@@ -351,26 +352,157 @@ pub fn settings(path: &Path) -> Result<bool> {
                             Ok(value) => config.ac_id = value,
                             Err(_) => ui.message("输入无效", "接入点编号必须是正整数")?,
                         },
-                        5 | 6 => match value.parse::<u64>() {
-                            Ok(value) => {
-                                if index == 5 {
-                                    config.online_interval_secs = value;
-                                } else {
-                                    config.retry_interval_secs = value;
-                                }
-                            }
+                        5 => match value.parse::<u64>() {
+                            Ok(value) => config.online_interval_secs = value,
                             Err(_) => ui.message("输入无效", "间隔必须是正整数秒数")?,
                         },
                         _ => unreachable!(),
                     }
                 }
             }
-            7 => match config.save(path) {
+            6 => probe_settings(&mut ui, &mut config)?,
+            7 => retry_settings(&mut ui, &mut config)?,
+            8 => match config.save(path) {
                 Ok(()) => return Ok(true),
                 Err(error) => ui.message("配置未保存", &format!("{error:#}"))?,
             },
             _ => return Ok(false),
         }
+    }
+}
+
+fn number<T: std::str::FromStr + std::fmt::Display>(
+    ui: &mut Ui,
+    label: &str,
+    current: &mut T,
+) -> Result<()> {
+    if let Some(value) = ui.input(label, &current.to_string())? {
+        match value.parse() {
+            Ok(value) => *current = value,
+            Err(_) => ui.message("输入无效", "请输入有效的非负整数")?,
+        }
+    }
+    Ok(())
+}
+
+fn probe_settings(ui: &mut Ui, config: &mut Config) -> Result<()> {
+    let mut selected = 0;
+    loop {
+        let probe = &mut config.probe;
+        let mut choices = vec![
+            format!(
+                "方式：{}",
+                if probe.mode == ProbeMode::Icmp {
+                    "ICMP"
+                } else {
+                    "TCP"
+                }
+            ),
+            format!("主目标 IPv4：{}", probe.primary),
+        ];
+        for i in 0..3 {
+            choices.push(format!(
+                "备用目标 {}：{}",
+                i + 1,
+                probe
+                    .backups
+                    .get(i)
+                    .map(ToString::to_string)
+                    .unwrap_or_else(|| "未配置".into())
+            ));
+        }
+        choices.extend([
+            format!("TCP 端口：{}", probe.tcp_port),
+            format!("轮询间隔（秒）：{}", probe.interval_secs),
+            format!("单目标超时（秒）：{}", probe.timeout_secs),
+            format!("连续失败门槛（轮）：{}", probe.failure_threshold),
+            "返回设置（主菜单保存后生效）".into(),
+        ]);
+        let Some(index) = ui.select("公网探测设置", &choices, selected)? else {
+            return Ok(());
+        };
+        selected = index;
+        match index {
+            0 => {
+                if let Some(mode) = ui.select(
+                    "探测方式",
+                    &["ICMP".into(), "TCP".into()],
+                    usize::from(probe.mode == ProbeMode::Tcp),
+                )? {
+                    probe.mode = if mode == 0 {
+                        ProbeMode::Icmp
+                    } else {
+                        ProbeMode::Tcp
+                    };
+                }
+            }
+            1..=4 => {
+                let current = if index == 1 {
+                    probe.primary.to_string()
+                } else {
+                    probe
+                        .backups
+                        .get(index - 2)
+                        .map(ToString::to_string)
+                        .unwrap_or_default()
+                };
+                let label = if index == 1 {
+                    "主目标 IPv4"
+                } else {
+                    "备用目标 IPv4（清空可移除）"
+                };
+                if let Some(value) = ui.input(label, &current)? {
+                    if value.is_empty() && index > 1 {
+                        if index - 2 < probe.backups.len() {
+                            probe.backups.remove(index - 2);
+                        }
+                    } else {
+                        match value.parse() {
+                            Ok(ip) => {
+                                if index == 1 {
+                                    probe.primary = ip;
+                                } else if let Some(target) = probe.backups.get_mut(index - 2) {
+                                    *target = ip;
+                                } else {
+                                    probe.backups.push(ip);
+                                }
+                            }
+                            Err(_) => ui.message("输入无效", "请输入 IPv4 地址，例如 223.5.5.5")?,
+                        }
+                    }
+                }
+            }
+            5 => number(ui, "TCP 端口", &mut probe.tcp_port)?,
+            6 => number(ui, "轮询间隔（秒）", &mut probe.interval_secs)?,
+            7 => number(ui, "单目标超时（秒）", &mut probe.timeout_secs)?,
+            8 => number(ui, "连续失败门槛（轮）", &mut probe.failure_threshold)?,
+            _ => return Ok(()),
+        }
+    }
+}
+
+fn retry_settings(ui: &mut Ui, config: &mut Config) -> Result<()> {
+    let mut selected = 0;
+    loop {
+        let values = config.retry_intervals_secs;
+        let choices = vec![
+            format!("前 3 次重试间隔（秒）：{}", values[0]),
+            format!("接下来 3 次重试间隔（秒）：{}", values[1]),
+            format!("后续重试间隔（秒）：{}", values[2]),
+            "返回设置（主菜单保存后生效）".into(),
+        ];
+        let Some(index) = ui.select("分阶段重试设置", &choices, selected)? else {
+            return Ok(());
+        };
+        if index == 3 {
+            return Ok(());
+        }
+        selected = index;
+        number(
+            ui,
+            "重试间隔（秒）",
+            &mut config.retry_intervals_secs[index],
+        )?;
     }
 }
 

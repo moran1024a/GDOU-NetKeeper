@@ -5,6 +5,7 @@ mod client;
 mod config;
 mod control;
 mod daemon;
+mod probe;
 mod protocol;
 mod state;
 mod tui;

@@ -2,6 +2,7 @@ use anyhow::{bail, Context, Result};
 use reqwest::Url;
 use serde::{Deserialize, Serialize};
 use std::io::Write;
+use std::net::Ipv4Addr;
 use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::path::Path;
 
@@ -15,18 +16,49 @@ pub struct Config {
     pub portal_url: String,
     pub ac_id: u32,
     pub interface: Option<String>,
-    #[serde(default = "online_interval")]
     pub online_interval_secs: u64,
-    #[serde(default = "retry_interval")]
-    pub retry_interval_secs: u64,
+    // Accepted for old configurations; staged retries replace this setting.
+    #[serde(skip_serializing, rename = "retry_interval_secs")]
+    pub _legacy_retry_interval_secs: Option<u64>,
+    pub retry_intervals_secs: [u64; 3],
+    pub probe: ProbeConfig,
 }
 
-fn online_interval() -> u64 {
-    60
+#[derive(Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum ProbeMode {
+    Icmp,
+    Tcp,
 }
 
-fn retry_interval() -> u64 {
-    15
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ProbeConfig {
+    pub mode: ProbeMode,
+    pub primary: Ipv4Addr,
+    pub backups: Vec<Ipv4Addr>,
+    pub tcp_port: u16,
+    pub interval_secs: u64,
+    pub timeout_secs: u64,
+    pub failure_threshold: u32,
+}
+
+impl Default for ProbeConfig {
+    fn default() -> Self {
+        Self {
+            mode: ProbeMode::Icmp,
+            primary: Ipv4Addr::new(223, 5, 5, 5),
+            backups: vec![
+                Ipv4Addr::new(119, 29, 29, 29),
+                Ipv4Addr::new(180, 76, 76, 76),
+                Ipv4Addr::new(223, 6, 6, 6),
+            ],
+            tcp_port: 53,
+            interval_secs: 2,
+            timeout_secs: 1,
+            failure_threshold: 3,
+        }
+    }
 }
 
 impl Default for Config {
@@ -37,8 +69,10 @@ impl Default for Config {
             portal_url: String::new(),
             ac_id: 0,
             interface: None,
-            online_interval_secs: online_interval(),
-            retry_interval_secs: retry_interval(),
+            online_interval_secs: 300,
+            _legacy_retry_interval_secs: None,
+            retry_intervals_secs: [5, 15, 30],
+            probe: ProbeConfig::default(),
         }
     }
 }
@@ -117,9 +151,34 @@ impl Config {
                 bail!("interface 必须是有效的 Linux 网卡名称；不绑定时请删除此配置项");
             }
         }
-        for interval in [self.online_interval_secs, self.retry_interval_secs] {
+        for interval in [self.online_interval_secs]
+            .into_iter()
+            .chain(self.retry_intervals_secs)
+        {
             if !(1..=86400).contains(&interval) {
                 bail!("检查和重试间隔必须在 1 到 86400 秒之间");
+            }
+        }
+        if self
+            .retry_intervals_secs
+            .windows(2)
+            .any(|pair| pair[0] > pair[1])
+        {
+            bail!("三个阶段的重试间隔必须依次不减");
+        }
+        let probe = &self.probe;
+        if !(1..=3600).contains(&probe.interval_secs)
+            || !(1..=30).contains(&probe.timeout_secs)
+            || !(1..=10).contains(&probe.failure_threshold)
+        {
+            bail!("探测间隔须为 1–3600 秒，超时为 1–30 秒，失败门槛为 1–10 轮");
+        }
+        if probe.backups.len() > 3 || probe.tcp_port == 0 {
+            bail!("最多配置 3 个备用目标，TCP 端口必须大于 0");
+        }
+        for ip in std::iter::once(&probe.primary).chain(&probe.backups) {
+            if ip.is_unspecified() || ip.is_multicast() || *ip == Ipv4Addr::BROADCAST {
+                bail!("探测目标必须是单播 IPv4 地址");
             }
         }
         Ok(())
@@ -135,13 +194,18 @@ mod tests {
     #[test]
     fn defaults_and_invalid_config() {
         let config = Config::parse(CONFIG).unwrap();
-        assert_eq!(config.online_interval_secs, 60);
-        assert_eq!(config.retry_interval_secs, 15);
+        assert_eq!(config.online_interval_secs, 300);
+        assert_eq!(config.retry_intervals_secs, [5, 15, 30]);
+        assert_eq!(config.probe.backups.len(), 3);
         assert!(config.interface.is_none());
         for extra in [
-            "retry_interval_secs = 0",
             "interface = ''",
             "unknown = true",
+            "retry_intervals_secs = [15, 5, 30]",
+            "[probe]\nprimary = '0.0.0.0'",
+            "[probe]\nprimary = 'bad-host'",
+            "[probe]\ntimeout_secs = 0",
+            "[probe]\nbackups = ['1.1.1.1', '2.2.2.2', '3.3.3.3', '4.4.4.4']",
         ] {
             assert!(Config::parse(&format!("{CONFIG}{extra}")).is_err());
         }
@@ -149,6 +213,21 @@ mod tests {
         assert!(
             Config::parse(&CONFIG.replace("http://10.0.0.1", "http://10.0.0.1/?ac_id=2")).is_err()
         );
+    }
+
+    #[test]
+    fn legacy_configuration_keeps_explicit_portal_interval_and_gains_probe_defaults() {
+        let config = Config::parse(&format!(
+            "{CONFIG}online_interval_secs = 60\nretry_interval_secs = 15"
+        ))
+        .unwrap();
+        assert_eq!(config.online_interval_secs, 60);
+        assert_eq!(config.retry_intervals_secs, [5, 15, 30]);
+        assert_eq!(config.probe.primary, Ipv4Addr::new(223, 5, 5, 5));
+        assert!(Config::parse(&format!("{CONFIG}retry_interval_secs = 0")).is_ok());
+        assert!(!toml::to_string(&config)
+            .unwrap()
+            .contains("retry_interval_secs ="));
     }
 
     #[test]

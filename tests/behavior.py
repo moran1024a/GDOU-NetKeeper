@@ -31,10 +31,12 @@ def wait_for(predicate, timeout=5):
 
 class Portal(http.server.BaseHTTPRequestHandler):
     online = False
-    reject = False
+    reject = None
     hanging = False
     calls = []
     logins = 0
+    login_times = []
+    probe = None
 
     def do_GET(self):
         request = urllib.parse.urlsplit(self.path)
@@ -50,9 +52,11 @@ class Portal(http.server.BaseHTTPRequestHandler):
         else:
             assert request.path.endswith("srun_portal")
             Portal.logins += 1
-            body = {"error": "password_error", "error_msg": "wrong password"} if Portal.reject else {"error": "ok"}
+            Portal.login_times.append(time.monotonic())
+            body = {"error": Portal.reject, "error_msg": "fixture rejection"} if Portal.reject else {"error": "ok"}
             if not Portal.reject:
                 Portal.online = True
+                Portal.probe.start()
         payload = (query["callback"][0] + "(" + json.dumps(body) + ");").encode()
         self.send_response(200)
         self.send_header("Content-Length", str(len(payload)))
@@ -63,17 +67,60 @@ class Portal(http.server.BaseHTTPRequestHandler):
         pass
 
 
+class ProbeServer:
+    """A loopback TCP endpoint which can really stop accepting connections."""
+    def __init__(self):
+        with socket.socket() as endpoint:
+            endpoint.bind(("127.0.0.1", 0))
+            self.port = endpoint.getsockname()[1]
+        self.listener = None
+        self.thread = None
+
+    def start(self):
+        if self.listener is not None:
+            return
+        endpoint = socket.socket()
+        endpoint.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        endpoint.bind(("127.0.0.1", self.port))
+        endpoint.listen()
+        endpoint.settimeout(0.1)
+        self.listener = endpoint
+
+        def serve():
+            while self.listener is endpoint:
+                try:
+                    connection, _ = endpoint.accept()
+                    connection.close()
+                except socket.timeout:
+                    continue
+                except OSError:
+                    break
+        self.thread = threading.Thread(target=serve, daemon=True)
+        self.thread.start()
+
+    def stop(self):
+        endpoint, self.listener = self.listener, None
+        if endpoint is not None:
+            endpoint.close()
+            self.thread.join(timeout=1)
+
+
 def backend_tests(binary):
+    probe = ProbeServer()
+    Portal.probe = probe
     server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Portal)
     threading.Thread(target=server.serve_forever, daemon=True).start()
     try:
         with tempfile.TemporaryDirectory(prefix="netkeeper-backend-") as directory:
             root = Path(directory)
             configuration = root / "config.toml"
-            configuration.write_text(
+            config_text = (
                 f"username='fixture'\npassword='fixture-password'\nportal_url='http://127.0.0.1:{server.server_port}'\n"
-                "ac_id=24\ninterface='lo'\nonline_interval_secs=1\nretry_interval_secs=1\n"
+                "ac_id=24\ninterface='lo'\nonline_interval_secs=30\nretry_intervals_secs=[1,2,3]\n"
+                f"[probe]\nmode='tcp'\nprimary='127.0.0.2'\nbackups=['127.0.0.1']\ntcp_port={probe.port}\n"
+                "interval_secs=1\ntimeout_secs=1\nfailure_threshold=3\n"
             )
+            configuration.write_text(config_text)
             endpoint = root / "notify.sock"
             notify = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
             notify.bind(str(endpoint))
@@ -95,6 +142,8 @@ def backend_tests(binary):
 
             def launch():
                 Portal.calls = []
+                Portal.login_times = []
+                Portal.logins = 0
                 messages.clear()
                 return subprocess.Popen(
                     [binary, "run", "--config", configuration, "--state-dir", root],
@@ -102,10 +151,19 @@ def backend_tests(binary):
                     stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
                 )
 
+            def stop(process):
+                count = len(Portal.calls)
+                process.terminate()
+                process.communicate(timeout=2)
+                assert process.returncode == 0 and state()["phase"] == "stopped"
+                assert state()["next_retry_at"] is None
+                time.sleep(0.2)
+                assert len(Portal.calls) == count
+
             process = None
             try:
-                # First failure must exit, without readiness or a background retry.
-                Portal.reject = True
+                Portal.online = False
+                Portal.reject = "password_error"
                 process = launch()
                 _, error = process.communicate(timeout=5)
                 assert process.returncode == 78 and "password_error" in error
@@ -114,31 +172,87 @@ def backend_tests(binary):
                 assert Portal.calls == ["/cgi-bin/rad_user_info", "/cgi-bin/get_challenge", "/cgi-bin/srun_portal"]
                 assert "fixture-password" not in (root / "status.json").read_text()
 
-                # Confirm readiness, then an unsuccessful reconnect followed by recovery.
-                Portal.reject = False
+                Portal.reject = None
                 process = launch()
                 wait_for(lambda: any("READY=1" in message for message in notifications()))
-                assert state()["phase"] == "online" and Portal.logins == 2
+                assert state()["phase"] == "online" and Portal.logins == 1
                 generation = state()["generation"]
                 process.send_signal(signal.SIGUSR1)
                 wait_for(lambda: state().get("generation", 0) > generation, timeout=0.8)
-                assert state()["phase"] == "online" and Portal.logins == 2
-                Portal.online = False
-                Portal.reject = True
-                wait_for(lambda: state().get("phase") == "retrying")
-                assert process.poll() is None
-                Portal.reject = False
-                wait_for(lambda: state().get("phase") == "online")
-                before = len(Portal.calls)
-                started = time.monotonic()
-                process.terminate()
-                process.communicate(timeout=2)
-                assert process.returncode == 0 and time.monotonic() - started < 2
-                assert state()["phase"] == "stopped"
-                time.sleep(0.2)
-                assert len(Portal.calls) == before
+                generation = state()["generation"]
+                calls = len(Portal.calls)
+                wait_for(lambda: state().get("probe") is not None)
+                assert state()["probe"]["reachable"] and "备用" in state()["probe"]["detail"]
+                assert state()["generation"] == generation and len(Portal.calls) == calls
 
-                # SIGTERM interrupts an in-flight initial request, not just the sleep.
+                # Two failed rounds must not trigger Portal traffic; a reachable
+                # round resets the consecutive count, even if the primary fails.
+                probe.stop()
+                wait_for(lambda: state()["probe_failures"] == 2)
+                assert len(Portal.calls) == calls
+                probe.start()
+                wait_for(lambda: state()["probe_failures"] == 0)
+                assert len(Portal.calls) == calls
+
+                # A real outage escalates on round three, then all three retry
+                # stages apply. Frequent probe ticks and SIGUSR1 cannot bypass it.
+                Portal.online = False
+                Portal.reject = "server_busy"
+                probe.stop()
+                wait_for(lambda: state()["phase"] == "retrying")
+                assert state()["probe_failures"] == 3
+                assert state()["recovery_attempts"] == 1
+                generation = state()["generation"]
+                calls = len(Portal.calls)
+                process.send_signal(signal.SIGUSR1)
+                wait_for(lambda: state()["generation"] > generation, timeout=0.8)
+                assert len(Portal.calls) == calls
+                wait_for(lambda: state()["recovery_attempts"] >= 8, timeout=25)
+                recovery_logins = Portal.login_times[1:]
+                gaps = [b - a for a, b in zip(recovery_logins, recovery_logins[1:])]
+                for actual, expected in zip(gaps, [1, 1, 1, 2, 2, 2, 3]):
+                    assert actual >= expected - 0.1, (actual, expected)
+                assert len(gaps) >= 7
+                Portal.reject = None
+                wait_for(lambda: state()["phase"] == "online", timeout=5)
+                assert state()["probe_failures"] == 0 and state()["recovery_attempts"] == 0
+                assert state()["next_retry_at"] is None
+
+                # Portal online + unreachable public targets is an outage, not
+                # another login request and not a false recovery.
+                logins = Portal.logins
+                probe.stop()
+                wait_for(lambda: state()["phase"] == "retrying")
+                assert "公网探测仍失败" in state()["detail"] and Portal.logins == logins
+                wait_for(lambda: state()["recovery_attempts"] >= 2)
+                assert Portal.logins == logins
+                probe.start()
+                wait_for(lambda: state()["phase"] == "online")
+                assert Portal.logins == logins
+
+                # Explicit credential rejection pauses all automatic requests.
+                Portal.online = False
+                Portal.reject = "password_error"
+                probe.stop()
+                wait_for(lambda: state()["phase"] == "paused")
+                calls = len(Portal.calls)
+                process.send_signal(signal.SIGUSR1)
+                time.sleep(1.3)
+                assert len(Portal.calls) == calls and state()["next_retry_at"] is None
+                stop(process)
+
+                # Low-frequency Portal checks remain active when probes pass.
+                configuration.write_text(config_text.replace("online_interval_secs=30", "online_interval_secs=2"))
+                Portal.reject = None
+                process = launch()
+                wait_for(lambda: any("READY=1" in message for message in notifications()))
+                calls = len(Portal.calls)
+                wait_for(lambda: len(Portal.calls) > calls, timeout=4)
+                assert Portal.logins == 1
+                stop(process)
+
+                # SIGTERM interrupts an in-flight initial request before any
+                # external HTTP fallback can occur.
                 notifications()
                 Portal.hanging = True
                 process = launch()
@@ -156,8 +270,8 @@ def backend_tests(binary):
     finally:
         server.shutdown()
         server.server_close()
-    print("Daemon readiness, fresh online confirmation, first failure, recovery, and stop cancellation: PASS")
-
+        probe.stop()
+    print("Daemon startup, fallback, failure threshold, staged retries, outage recovery, pause, periodic checks, and stop: PASS")
 
 def tui_tests(test_binary):
     with tempfile.TemporaryDirectory(prefix="netkeeper-tui-") as directory:
@@ -203,6 +317,12 @@ def tui_tests(test_binary):
                     send(b"\x1b[B\r\x15updated-user\r")
                     send(b"\x1b[B\r\x15" + "plain-pass-测试123".encode() + b"\r")
                     assert "plain-pass-测试123" in output.decode(errors="replace")
+                    send(b"\x1b[H" + b"\x1b[B" * 6 + b"\r")  # Probe settings.
+                    assert "公网探测设置" in output.decode(errors="replace")
+                    send(b"\r\x1b[B\r")  # ICMP -> TCP, using a selector.
+                    send(b"\x1b[B\r\x15127.0.0.1\r")
+                    send(b"\x1b[B\r\x15\r")  # Clear one optional backup.
+                    send(b"\x1b[F\r")  # Return without committing yet.
                     send(b"\x1b[F\x1b[A\r")  # Save.
                 else:
                     send(b"\x1b[B\r\x15unsaved-value\x1b")  # Cancel edit.
@@ -215,6 +335,9 @@ def tui_tests(test_binary):
                     settings = tomllib.loads(configuration.read_text())
                     assert settings["username"] == "updated-user"
                     assert settings["password"] == "plain-pass-测试123"
+                    assert settings["probe"]["mode"] == "tcp"
+                    assert settings["probe"]["primary"] == "127.0.0.1"
+                    assert len(settings["probe"]["backups"]) == 2
                     assert "interface" not in settings
                     assert configuration.stat().st_mode & 0o777 == 0o600
                 else:

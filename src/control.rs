@@ -105,6 +105,23 @@ impl Controller {
             if service.running() && state.pid != service.pid {
                 text.push_str("\n当前进程尚未更新状态，上述为历史记录");
             }
+            if let Some(probe) = &state.probe {
+                text.push_str(&format!(
+                    "\n公网探测（{} 秒前）：{}\n连续失败：{} 轮",
+                    state::now().saturating_sub(probe.checked_at),
+                    probe.detail,
+                    state.probe_failures
+                ));
+            }
+            text.push_str(&format!("\n恢复尝试：{} 次", state.recovery_attempts));
+            if service.running() && state.pid == service.pid {
+                if let Some(at) = state.next_retry_at {
+                    text.push_str(&format!(
+                        "\n下次重试：约 {} 秒后",
+                        at.saturating_sub(state::now())
+                    ));
+                }
+            }
         } else if !service.text.is_empty() {
             text.push_str(&format!("\n最近结果：{}", service.text));
         }
@@ -168,7 +185,10 @@ impl Controller {
                     return Ok(());
                 }
                 if refresh && fresh {
-                    if let Some(state) = state.as_ref().filter(|s| s.phase == Phase::Retrying) {
+                    if let Some(state) = state
+                        .as_ref()
+                        .filter(|s| matches!(s.phase, Phase::Retrying | Phase::Paused))
+                    {
                         bail!("在线确认失败：{}；原有服务仍在运行", state.detail);
                     }
                 }
@@ -239,7 +259,8 @@ elif 'kill' in args:
     path = root / 'status.json'
     if path.exists():
         state = json.loads(path.read_text())
-        state['generation'] = state.get('generation', 0) + 1
+        if mode != 'probe_only':
+            state['generation'] = state.get('generation', 0) + 1
         if mode == 'refresh_failed':
             state.update(phase='retrying', detail='password_error')
         path.write_text(json.dumps(state))
@@ -308,6 +329,23 @@ elif 'show' in args:
     }
 
     #[tokio::test]
+    async fn probe_updates_cannot_satisfy_repeated_start() {
+        let (directory, controller) = fixture("ready");
+        controller
+            .start(std::future::pending(), |_| Ok(()))
+            .await
+            .unwrap();
+        std::fs::write(directory.path().join("mode"), "probe_only").unwrap();
+        assert!(controller
+            .start(std::future::pending(), |_| Ok(()))
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("超时"));
+        assert!(controller.inspect().await.unwrap().running());
+    }
+
+    #[tokio::test]
     async fn failed_timed_out_and_stale_starts_are_stopped() {
         for mode in ["failed", "waiting", "stale"] {
             let (directory, controller) = fixture(mode);
@@ -318,7 +356,9 @@ elif 'show' in args:
             if mode == "failed" {
                 assert!(error.to_string().contains("password_error"));
             }
-            let calls = std::fs::read_to_string(directory.path().join("calls")).unwrap();
+            let calls = std::fs::read_to_string(directory.path().join("calls")).unwrap_or_else(
+                |read_error| panic!("mode={mode}; start error={error:#}; call log={read_error}"),
+            );
             assert!(calls.contains("--system stop netkeeper.service"));
             assert!(!controller.inspect().await.unwrap().running());
         }

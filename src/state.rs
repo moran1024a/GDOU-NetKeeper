@@ -15,6 +15,7 @@ pub enum Phase {
     Starting,
     Online,
     Retrying,
+    Paused,
     Failed,
     Stopped,
 }
@@ -28,6 +29,14 @@ pub struct State {
     #[serde(default)]
     pub generation: u64,
     pub detail: String,
+    #[serde(default)]
+    pub probe: Option<crate::probe::ProbeResult>,
+    #[serde(default)]
+    pub probe_failures: u32,
+    #[serde(default)]
+    pub recovery_attempts: u32,
+    #[serde(default)]
+    pub next_retry_at: Option<u64>,
 }
 
 impl State {
@@ -39,6 +48,10 @@ impl State {
             checked_at: 0,
             generation: 0,
             detail: "正在启动".into(),
+            probe: None,
+            probe_failures: 0,
+            recovery_attempts: 0,
+            next_retry_at: None,
         }
     }
 
@@ -47,6 +60,11 @@ impl State {
         self.checked_at = now();
         self.generation += 1;
         self.detail = detail.to_owned();
+        self.save(directory)
+    }
+
+    // Probe-only writes do not advance the Portal confirmation generation.
+    pub fn save(&self, directory: &Path) -> Result<()> {
         let mut file = tempfile::NamedTempFile::new_in(directory)?;
         file.as_file()
             .set_permissions(std::fs::Permissions::from_mode(0o644))?;

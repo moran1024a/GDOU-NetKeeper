@@ -1,15 +1,15 @@
 # GDOU NetKeeper
 
 Linux SRUN 校园网认证服务，目标平台 Ubuntu 24.04，支持有线、Wi-Fi 和网卡绑定。
-v0.2.0 提供终端菜单和四个管理命令，由 systemd 管理后台进程。
+v0.3.0 提供终端菜单、快速连通性探测和自动恢复，由 systemd 管理后台进程。
 
 ## 安装与使用
 
-将构建得到的 `.deb` 和 `.deb.sha256` 放在同一目录，校验并安装：
+从 [Releases](https://github.com/moran1024a/GDOU-NetKeeper/releases) 下载 `.deb` 和 `.deb.sha256`，放在同一目录校验并安装：
 
 ```bash
-sha256sum -c gdou-netkeeper_0.2.0-1_amd64.deb.sha256
-sudo apt install ./gdou-netkeeper_0.2.0-1_amd64.deb
+sha256sum -c gdou-netkeeper_0.3.0-1_amd64.deb.sha256
+sudo apt install ./gdou-netkeeper_0.3.0-1_amd64.deb
 sudo netkeeper
 ```
 
@@ -26,13 +26,32 @@ sudo netkeeper
 | `sudo netkeeper settings` | 修改配置；服务运行时可选择立即重启应用或下次启动生效 |
 
 启动最多等待 30 秒。首次认证失败、超时或取消会显示原因并停止本次新启动的服务。
-重复 `start` 会立即重新确认在线，不重复创建进程；失败或取消时保留原有服务。
-首次成功后，默认每 60 秒巡检，掉线或认证失败每 15 秒重试；间隔可在设置中修改。
+服务正常时，重复 `start` 会立即重新确认在线，不重复创建进程；失败或取消时保留原有服务。
 退出菜单不会停止已启动的后台服务。
+
+正常时每 **2 秒**开始一轮 ICMP 探测，单目标超时 **1 秒**。先检测主目标，失败后并行检查备用；
+任意目标成功就清零失败计数。连续 **3 轮全部失败**提前触发 Portal 检查，正常时仍每 **300 秒**巡检 Portal。
+探测和认证串行执行，超时不堆积补跑。Portal 在线但公网探测失败时仅复查，不重复登录。
+
+| 默认目标 | 地址 |
+| --- | --- |
+| 主目标：阿里公共 DNS | `223.5.5.5` |
+| 备用：腾讯 DNSPod、百度公共 DNS、阿里公共 DNS | `119.29.29.29`、`180.76.76.76`、`223.6.6.6` |
+
+恢复阶段统一按 **5 秒 × 3 次 → 15 秒 × 3 次 → 持续 30 秒**重试；等待从本轮结束后计算。
+期间暂停普通轮询，重复 `start` 也不会绕过等待；恢复时确认公网探测通过后重置计数。
+明确识别的凭据错误会暂停自动请求，修改配置并重启后恢复；未知错误仍按退避重试。
+`status` 显示最近探测、连续失败轮数、恢复尝试次数和下次重试时间。
+
+在设置中可修改各项间隔、超时、失败门槛，切换 ICMP / TCP，编辑主目标及最多三个可选备用目标。
+目标使用 IPv4 地址；TCP 模式的所有目标使用同一可配置端口，默认 53。全部探测绑定所选网卡。
+默认目标尚未在目标校园网验证；这些地址仅用于探测，不修改系统 DNS。
 
 配置保存在 `/etc/netkeeper/config.toml`，权限为 `0600`；取消设置不覆盖原配置。
 首次安装不自动启动，也不启用开机自启。升级保留配置，并重启正在运行的服务。
-从 0.1.0 升级可直接安装新版包，原配置仍可使用；旧的 `--once` / `--check` 已移除。
+从 0.1.0 / 0.2.0 升级可直接安装新版包，原配置仍可使用；新增字段采用默认值。
+已有 `online_interval_secs` 值保留，可在设置中改为 300 秒；旧 `retry_interval_secs` 忽略，保存后移除，
+改用 `retry_intervals_secs = [5, 15, 30]`。旧的 `--once` / `--check` 已移除。
 已有开机自启设置会保留，可用 `sudo systemctl disable netkeeper` 关闭。
 非交互环境支持 `start`、`stop`、`status`；配置无效时提示先在终端完成设置。
 
@@ -43,7 +62,7 @@ sudo netkeeper
 
 ## 构建与测试
 
-需要 Rust stable、Python 3.11+、C 链接器和 `dpkg-dev`，在 Ubuntu 24.04 原生构建。
+需要 Rust stable、Python 3.11+、C 链接器、`dpkg-dev` 和 `iputils-ping`，在 Ubuntu 24.04 原生构建。
 
 ```bash
 cargo build --locked
@@ -52,9 +71,9 @@ python3 tests/behavior.py
 python3 packaging/build-deb.py
 ```
 
-安装包和 SHA-256 文件输出到 `dist/`，运行时无需 Rust 工具链。
+安装包和 SHA-256 文件输出到 `dist/`，运行时无需 Rust 工具链；安装 deb 会自动安装 `iputils-ping` 依赖。
 依赖已缓存时可用 `python3 packaging/build-deb.py --offline` 打包。
-测试使用本机模拟 Portal 和伪终端，覆盖首次认证、失败清理、恢复、停止以及菜单交互；
-不连接校园网，也不安装或启动本机 systemd 服务。新管理流程尚未在校园网实机验证。
+测试使用回环 ICMP/TCP、模拟 Portal 和伪终端，覆盖主备切换、连续失败、全部退避阶段、暂停、恢复及停止；
+不连接校园网，也不安装或启动本机 systemd 服务。本版本尚未在校园网实机验证。
 
 本项目采用 [MIT License](LICENSE)，第三方依赖保留各自许可证。

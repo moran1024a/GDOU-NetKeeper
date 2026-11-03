@@ -2,13 +2,24 @@
 username = ""
 password = ""
 
-# 填写实际 Portal 根地址（http(s)://host[:port]）和接入点编号。
+# Portal 根地址及接入点编号。
 portal_url = ""
 ac_id = 0
 
 # 可选；省略时使用系统路由。
 # interface = "enp3s0"
 
-# 检查和重试间隔，单位为秒。
-online_interval_secs = 60
-retry_interval_secs = 15
+# 正常时的 Portal 巡检间隔。
+online_interval_secs = 300
+# 前 3 次重试、接下来 3 次、之后持续使用的等待秒数。
+retry_intervals_secs = [5, 15, 30]
+
+[probe]
+mode = "icmp" # 可选 icmp 或 tcp
+primary = "223.5.5.5"
+# 可清空为 []，最多 3 个备用 IPv4；主目标失败后并行检查。
+backups = ["119.29.29.29", "180.76.76.76", "223.6.6.6"]
+tcp_port = 53 # TCP 模式下所有目标使用的端口
+interval_secs = 2
+timeout_secs = 1
+failure_threshold = 3

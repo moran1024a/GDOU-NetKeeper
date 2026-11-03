@@ -97,7 +97,7 @@ def main():
         (control / "control").write_text(
             f"Package: {name}\nVersion: {version}\nArchitecture: {architecture}\n"
             f"Maintainer: {MAINTAINER}\nSection: net\nPriority: optional\n"
-            f"Depends: {shared}, systemd (>= 255), init-system-helpers (>= 1.56)\n"
+            f"Depends: {shared}, systemd (>= 255), init-system-helpers (>= 1.56), iputils-ping\n"
             f"Installed-Size: {installed_size}\n"
             "Description: SRUN campus network authentication service\n"
             " Automatically authenticates and reconnects with optional interface binding.\n"
