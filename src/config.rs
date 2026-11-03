@@ -1,10 +1,14 @@
 use anyhow::{bail, Context, Result};
 use reqwest::Url;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
+use std::io::Write;
+use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::path::Path;
 
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
+pub const CONFIG_PATH: &str = "/etc/netkeeper/config.toml";
+
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct Config {
     pub username: String,
     pub password: String,
@@ -25,6 +29,20 @@ fn retry_interval() -> u64 {
     15
 }
 
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            username: String::new(),
+            password: String::new(),
+            portal_url: String::new(),
+            ac_id: 0,
+            interface: None,
+            online_interval_secs: online_interval(),
+            retry_interval_secs: retry_interval(),
+        }
+    }
+}
+
 impl Config {
     pub fn load(path: &Path) -> Result<Self> {
         let text = std::fs::read_to_string(path).context("无法读取配置文件")?;
@@ -40,7 +58,35 @@ impl Config {
         Ok(config)
     }
 
-    fn validate(&self) -> Result<()> {
+    pub fn for_edit(path: &Path) -> Self {
+        std::fs::read_to_string(path)
+            .ok()
+            .and_then(|text| toml::from_str(&text).ok())
+            .unwrap_or_default()
+    }
+
+    pub fn save(&self, path: &Path) -> Result<()> {
+        self.validate()?;
+        let parent = path.parent().context("配置文件缺少父目录")?;
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(parent)?;
+        let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
+        temporary
+            .as_file()
+            .set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        temporary.write_all(toml::to_string_pretty(self)?.as_bytes())?;
+        temporary.as_file().sync_all()?;
+        temporary
+            .persist(path)
+            .map_err(|error| error.error)
+            .context("保存配置失败")?;
+        std::fs::File::open(parent)?.sync_all()?;
+        Ok(())
+    }
+
+    pub fn validate(&self) -> Result<()> {
         if self.username.trim().is_empty() || self.username.trim() != self.username {
             bail!("username 不能为空或包含首尾空白，请保留完整账号后缀");
         }
@@ -111,5 +157,23 @@ mod tests {
             .err()
             .unwrap();
         assert!(!format!("{error:#}").contains("very-private-password"));
+    }
+
+    #[test]
+    fn saving_is_validated_private_and_round_trips_plaintext() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.toml");
+        let mut config = Config::parse(CONFIG).unwrap();
+        config.password = "visible+密码\\\"".into();
+        config.save(&path).unwrap();
+        assert_eq!(Config::load(&path).unwrap().password, config.password);
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        let before = std::fs::read(&path).unwrap();
+        config.ac_id = 0;
+        assert!(config.save(&path).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), before);
     }
 }

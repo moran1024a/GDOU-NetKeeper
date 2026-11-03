@@ -102,7 +102,10 @@ impl<'a> SrunClient<'a> {
             )
             .await?;
         if challenge.get("error").is_some_and(|v| v != "ok" && v != "") {
-            bail!("Challenge 请求被拒绝（请检查账号、Portal 和 ac_id）");
+            bail!(
+                "Challenge 请求被拒绝：{}",
+                portal_error(&challenge, self.config, &[])
+            );
         }
         let token = challenge["challenge"]
             .as_str()
@@ -114,6 +117,12 @@ impl<'a> SrunClient<'a> {
             self.config.ac_id,
             token,
         )?;
+        let secrets = [
+            params.password.clone(),
+            params.info.clone(),
+            params.chksum.clone(),
+            token.to_owned(),
+        ];
         let response = self
             .api(
                 "srun_portal",
@@ -135,8 +144,10 @@ impl<'a> SrunClient<'a> {
             )
             .await?;
         if response["error"] != "ok" {
-            // Do not log arbitrary server text: it can echo account details or auth parameters.
-            bail!("Portal 拒绝登录（请检查凭据、接入点及账号状态）");
+            bail!(
+                "Portal 拒绝登录：{}",
+                portal_error(&response, self.config, &secrets)
+            );
         }
         Ok(())
     }
@@ -170,6 +181,36 @@ impl<'a> SrunClient<'a> {
             .with_context(|| format!("{endpoint} 请求失败"))?;
         let body = read_body(response).await?;
         protocol::parse_response(&body, &callback)
+    }
+}
+
+fn portal_error(value: &Value, config: &Config, secrets: &[String]) -> String {
+    let mut details = Vec::new();
+    for field in ["error", "error_msg", "res", "ecode"] {
+        let text = match &value[field] {
+            Value::String(text) => text.clone(),
+            Value::Number(number) => number.to_string(),
+            _ => continue,
+        };
+        if text.is_empty() || text == "0" {
+            continue;
+        }
+        let mut text = text;
+        for secret in [&config.password, &config.username]
+            .into_iter()
+            .chain(secrets)
+        {
+            if !secret.is_empty() {
+                text = text.replace(secret, "[已省略]");
+            }
+        }
+        let clean: String = text.chars().filter(|c| !c.is_control()).take(200).collect();
+        details.push(format!("{field}={clean}"));
+    }
+    if details.is_empty() {
+        "服务器未提供具体原因".into()
+    } else {
+        details.join("；")
     }
 }
 
@@ -220,6 +261,17 @@ mod tests {
         net::TcpListener,
         task::JoinHandle,
     };
+
+    #[tokio::test]
+    async fn rejection_reason_is_reported_without_credentials() {
+        let (config, server) = mock_portal(vec![]).await;
+        let value = serde_json::json!({"error": "password_error", "error_msg": format!("bad password for {}: {}\u{1b}", config.username, config.password), "ecode": 42});
+        let detail = portal_error(&value, &config, &[]);
+        assert!(detail.contains("password_error") && detail.contains("ecode=42"));
+        assert!(!detail.contains(&config.password) && !detail.contains(&config.username));
+        assert!(!detail.contains('\u{1b}'));
+        requests(server).await;
+    }
 
     // Loopback only; replies are supplied by each test, never by the campus network.
     async fn mock_portal(replies: Vec<(u16, &'static str)>) -> (Config, JoinHandle<Vec<Url>>) {
@@ -370,7 +422,7 @@ mod tests {
             ])
             .await;
             let error = cycle(&config).await.unwrap_err();
-            assert!(!format!("{error:#}").contains("private-server-text"));
+            assert!(format!("{error:#}").contains("challenge_error"));
             assert_eq!(requests(server).await[2].path(), "/cgi-bin/get_challenge");
         }
     }

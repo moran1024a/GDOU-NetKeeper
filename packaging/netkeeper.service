@@ -4,11 +4,15 @@ After=network.target
 ConditionPathExists=/etc/netkeeper/config.toml
 
 [Service]
-Type=exec
-ExecStart=/usr/bin/netkeeper --config %d/config
-Restart=on-failure
-RestartSec=15s
+Type=notify
+NotifyAccess=main
+ExecStart=/usr/bin/netkeeper run --config %d/config
+Restart=no
+TimeoutStartSec=35s
 TimeoutStopSec=5s
+RuntimeDirectory=netkeeper
+RuntimeDirectoryMode=0755
+RuntimeDirectoryPreserve=yes
 # systemd reads the root-only config and supplies it to a temporary service user.
 DynamicUser=yes
 LoadCredential=config:/etc/netkeeper/config.toml

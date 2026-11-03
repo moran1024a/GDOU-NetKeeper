@@ -101,7 +101,7 @@ def main():
             f"Installed-Size: {installed_size}\n"
             "Description: SRUN campus network authentication service\n"
             " Automatically authenticates and reconnects with optional interface binding.\n"
-            " Configure /etc/netkeeper/config.toml and enable netkeeper.service after installation.\n"
+            " Run sudo netkeeper for interactive setup and service management.\n"
         )
         checksums = []
         for path in sorted((staging / "usr").rglob("*")):

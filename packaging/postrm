@@ -8,6 +8,8 @@ case "$1" in
     purge)
         deb-systemd-helper purge netkeeper.service >/dev/null || true
         deb-systemd-helper unmask netkeeper.service >/dev/null || true
+        rm -f "${DPKG_ROOT:-}/run/netkeeper/status.json"
+        rmdir "${DPKG_ROOT:-}/run/netkeeper" 2>/dev/null || true
         ;;
 esac
 

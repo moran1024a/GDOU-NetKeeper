@@ -137,7 +137,7 @@ pub fn status(value: &Value) -> Status {
         .as_str()
     {
         "ok" => Status::Online,
-        "not_online" | "notonline" | "offline" => Status::Offline,
+        "not_online" | "not_online_error" | "notonline" | "offline" => Status::Offline,
         _ => Status::Unknown,
     }
 }
@@ -180,7 +180,7 @@ mod tests {
         ] {
             assert_eq!(status(&parse_response(text, "cb").unwrap()), Status::Online);
         }
-        for code in ["not_online", "notonline", "offline"] {
+        for code in ["not_online", "not_online_error", "notonline", "offline"] {
             assert_eq!(status(&serde_json::json!({"error": code})), Status::Offline);
         }
         assert_eq!(
