@@ -1,0 +1,26 @@
+[Unit]
+Description=GDOU SRUN network authentication
+After=network.target
+ConditionPathExists=/etc/netkeeper/config.toml
+
+[Service]
+Type=exec
+ExecStart=/usr/bin/netkeeper --config %d/config
+Restart=on-failure
+RestartSec=15s
+TimeoutStopSec=5s
+# systemd reads the root-only config and supplies it to a temporary service user.
+DynamicUser=yes
+LoadCredential=config:/etc/netkeeper/config.toml
+# Some kernels require this capability for SO_BINDTODEVICE.
+AmbientCapabilities=CAP_NET_RAW
+CapabilityBoundingSet=CAP_NET_RAW
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

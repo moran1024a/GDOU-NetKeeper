@@ -1,0 +1,20 @@
+#!/bin/sh
+set -e
+
+case "$1" in
+    remove)
+        deb-systemd-helper mask netkeeper.service >/dev/null || true
+        ;;
+    purge)
+        deb-systemd-helper purge netkeeper.service >/dev/null || true
+        deb-systemd-helper unmask netkeeper.service >/dev/null || true
+        ;;
+esac
+
+case "$1" in
+    remove|purge)
+        if [ -z "${DPKG_ROOT:-}" ] && [ -d /run/systemd/system ]; then
+            systemctl --system daemon-reload || true
+        fi
+        ;;
+esac

@@ -1,0 +1,4 @@
+/target/
+/dist/
+/config.toml
+*.deb

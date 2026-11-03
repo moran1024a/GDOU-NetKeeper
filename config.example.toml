@@ -1,0 +1,14 @@
+# 填写完整账号（含后缀）和原始密码。
+username = ""
+password = ""
+
+# 填写实际 Portal 根地址（http(s)://host[:port]）和接入点编号。
+portal_url = ""
+ac_id = 0
+
+# 可选；省略时使用系统路由。
+# interface = "enp3s0"
+
+# 检查和重试间隔，单位为秒。
+online_interval_secs = 60
+retry_interval_secs = 15
