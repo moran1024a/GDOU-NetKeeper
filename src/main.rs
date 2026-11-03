@@ -5,6 +5,7 @@ mod client;
 mod config;
 mod control;
 mod daemon;
+mod discovery;
 mod probe;
 mod protocol;
 mod state;
@@ -36,6 +37,8 @@ enum Action {
     Start,
     /// 停止服务及所有巡检、重试
     Stop,
+    /// 停止服务并注销当前校园网登录（可能断开远程连接）
+    Logout,
     /// 查看服务和最近认证状态（不请求网络）
     Status,
     /// 交互修改网卡、账号、密码及认证参数
@@ -69,12 +72,12 @@ fn require_admin() -> Result<()> {
     Ok(())
 }
 
-fn ensure_configured() -> Result<()> {
+async fn ensure_configured() -> Result<()> {
     if let Err(error) = Config::load(Path::new(CONFIG_PATH)) {
         if !tui::available() {
             bail!("配置无效：{error:#}；请先在交互终端运行 sudo netkeeper settings");
         }
-        if !tui::settings(Path::new(CONFIG_PATH))? {
+        if !tui::settings(Path::new(CONFIG_PATH)).await? {
             bail!("设置已取消，未启动服务");
         }
     }
@@ -82,7 +85,7 @@ fn ensure_configured() -> Result<()> {
 }
 
 async fn start(controller: &Controller) -> Result<()> {
-    ensure_configured()?;
+    ensure_configured().await?;
     let interactive = tui::available();
     let mut ui = if interactive {
         Some(tui::Ui::new()?)
@@ -111,7 +114,7 @@ async fn start(controller: &Controller) -> Result<()> {
 
 // Returns true when the user restarted the service after saving.
 async fn settings(controller: &Controller) -> Result<bool> {
-    if !tui::settings(Path::new(CONFIG_PATH))? {
+    if !tui::settings(Path::new(CONFIG_PATH)).await? {
         println!("设置已取消，原配置保持不变");
         return Ok(false);
     }
@@ -133,6 +136,14 @@ async fn settings(controller: &Controller) -> Result<bool> {
     Ok(false)
 }
 
+async fn logout(controller: &Controller) -> Result<()> {
+    let config = Config::load(Path::new(CONFIG_PATH))?;
+    println!("正在停止服务并注销校园网，此出口的远程连接可能断开");
+    let message = controller.logout(&config).await?;
+    println!("{message}；服务保持停止，不会自动重连");
+    Ok(())
+}
+
 async fn run(args: Args) -> Result<()> {
     let controller = Controller::default();
     match args.command {
@@ -145,6 +156,7 @@ async fn run(args: Args) -> Result<()> {
     }
     match args.command {
         Some(Action::Start) => start(&controller).await,
+        Some(Action::Logout) => logout(&controller).await,
         Some(Action::Stop) => {
             controller.stop().await?;
             println!("服务已停止，不再巡检或重试");
@@ -167,6 +179,7 @@ async fn run(args: Args) -> Result<()> {
                         "停止服务".into(),
                         "查看状态".into(),
                         "修改设置".into(),
+                        "注销校园网".into(),
                         "退出".into(),
                     ],
                     selected,
@@ -184,6 +197,16 @@ async fn run(args: Args) -> Result<()> {
                     Some(3) => {
                         if settings(&controller).await? {
                             return Ok(());
+                        }
+                    }
+                    Some(4) => {
+                        if tui::Ui::new()?.select(
+                            "注销校园网：将停止服务，并可能断开远程连接",
+                            &["取消".into(), "确认注销，保持服务停止".into()],
+                            0,
+                        )? == Some(1)
+                        {
+                            return logout(&controller).await;
                         }
                     }
                     _ => return Ok(()),

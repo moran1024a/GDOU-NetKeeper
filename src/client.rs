@@ -48,26 +48,7 @@ pub struct SrunClient<'a> {
 impl<'a> SrunClient<'a> {
     pub async fn new(config: &'a Config) -> Result<Self> {
         let portal = Url::parse(&config.portal_url)?;
-        let host = portal.host_str().context("Portal 缺少主机名")?;
-        let port = portal.port_or_known_default().context("Portal 缺少端口")?;
-        let address = tokio::time::timeout(AUTH_TIMEOUT, tokio::net::lookup_host((host, port)))
-            .await
-            .context("Portal DNS 解析超时")?
-            .context("Portal DNS 解析失败")?
-            .find(SocketAddr::is_ipv4)
-            .context("Portal 没有可用 IPv4 地址")?;
-        let ip = outbound_ip(address, config.interface.as_deref())?;
-        let mut builder = Client::builder()
-            .no_proxy()
-            .redirect(Policy::none())
-            .timeout(AUTH_TIMEOUT)
-            .local_address(IpAddr::V4(ip))
-            // Pin the address used for route selection for this round, avoiding a second DNS result.
-            .resolve(host, address);
-        if let Some(interface) = &config.interface {
-            builder = builder.interface(interface);
-        }
-        let http = builder.build().context("无法创建 HTTP 客户端")?;
+        let (http, ip) = bound_http(&portal, config.interface.as_deref()).await?;
         Ok(Self {
             config,
             http,
@@ -83,6 +64,65 @@ impl<'a> SrunClient<'a> {
         self.login().await?;
         // The login response alone does not prove the connection is online.
         Ok(self.online().await)
+    }
+
+    pub async fn logout(&self) -> Result<&'static str> {
+        let state = self
+            .api("rad_user_info", vec![], PROBE_TIMEOUT)
+            .await
+            .context("无法查询登录状态，未发送注销请求")?;
+        match protocol::status(&state) {
+            Status::Offline => return Ok("当前已经离线，无需注销"),
+            Status::Unknown => bail!("认证状态无法识别，未发送注销请求"),
+            Status::Online => {}
+        }
+        // The Portal may see a translated address when the selected link uses NAT.
+        let ip = match state.get("online_ip").and_then(Value::as_str) {
+            Some(value) if !value.is_empty() => value
+                .parse::<Ipv4Addr>()
+                .context("服务器返回的在线 IPv4 无效，未发送注销请求")?,
+            _ => self.ip,
+        };
+        if ip.is_unspecified() || ip.is_multicast() || ip == Ipv4Addr::BROADCAST {
+            bail!("服务器返回的在线 IPv4 无效，未发送注销请求");
+        }
+        let response = self
+            .api(
+                "srun_portal",
+                vec![
+                    ("action", "logout".into()),
+                    ("username", self.config.username.clone()),
+                    ("ip", ip.to_string()),
+                    ("ac_id", self.config.ac_id.to_string()),
+                    ("os", "linux".into()),
+                    ("name", "linux".into()),
+                ],
+                AUTH_TIMEOUT,
+            )
+            .await;
+        // A disconnected response does not tell us whether the server accepted logout.
+        // Send logout only once; allow a short delay for the session state to settle.
+        let mut confirmed_online = false;
+        for attempt in 0..3 {
+            if attempt > 0 {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+            let result = self.api("rad_user_info", vec![], PROBE_TIMEOUT).await;
+            match result.as_ref().map(protocol::status) {
+                Ok(Status::Offline) => return Ok("已确认注销校园网"),
+                Ok(Status::Online) => confirmed_online = true,
+                _ => confirmed_online = false,
+            }
+        }
+        let detail = match response {
+            Ok(value) if value["error"] != "ok" => portal_error(&value, self.config, &[]),
+            Err(error) => format!("{error:#}"),
+            _ => "服务器未确认下线".into(),
+        };
+        if confirmed_online {
+            bail!("注销后仍显示在线：{detail}");
+        }
+        bail!("无法确认注销结果：{detail}")
     }
 
     async fn online(&self) -> bool {
@@ -230,6 +270,32 @@ fn portal_error(value: &Value, config: &Config, secrets: &[String]) -> String {
     }
 }
 
+pub(crate) async fn bound_http(
+    portal: &Url,
+    interface: Option<&str>,
+) -> Result<(Client, Ipv4Addr)> {
+    let host = portal.host_str().context("Portal 缺少主机名")?;
+    let port = portal.port_or_known_default().context("Portal 缺少端口")?;
+    let address = tokio::time::timeout(AUTH_TIMEOUT, tokio::net::lookup_host((host, port)))
+        .await
+        .context("Portal DNS 解析超时")?
+        .context("Portal DNS 解析失败")?
+        .find(SocketAddr::is_ipv4)
+        .context("Portal 没有可用 IPv4 地址")?;
+    let ip = outbound_ip(address, interface)?;
+    let mut builder = Client::builder()
+        .no_proxy()
+        .redirect(Policy::none())
+        .timeout(AUTH_TIMEOUT)
+        .local_address(IpAddr::V4(ip))
+        // Pin the address selected for this request to the same local route.
+        .resolve(host, address);
+    if let Some(interface) = interface {
+        builder = builder.interface(interface);
+    }
+    Ok((builder.build().context("无法创建 HTTP 客户端")?, ip))
+}
+
 fn outbound_ip(destination: SocketAddr, interface: Option<&str>) -> Result<Ipv4Addr> {
     let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
     if let Some(interface) = interface {
@@ -247,7 +313,7 @@ fn outbound_ip(destination: SocketAddr, interface: Option<&str>) -> Result<Ipv4A
     }
 }
 
-async fn read_body(mut response: Response) -> Result<String> {
+pub(crate) async fn read_body(mut response: Response) -> Result<String> {
     if !response.status().is_success() || response.headers().contains_key(reqwest::header::LOCATION)
     {
         bail!(
@@ -360,6 +426,87 @@ mod tests {
         let requests = requests(server).await;
         assert_eq!(requests.len(), 1);
         assert_eq!(requests[0].path(), "/cgi-bin/rad_user_info");
+    }
+
+    #[tokio::test]
+    async fn logout_sends_one_request_without_password_and_confirms_offline() {
+        let (config, server) = mock_portal(vec![
+            (200, r#"{"error":"ok","online_ip":"10.20.30.40"}"#),
+            (200, r#"{"error":"ok"}"#),
+            (200, r#"{"error":"not_online"}"#),
+        ])
+        .await;
+        assert_eq!(
+            SrunClient::new(&config)
+                .await
+                .unwrap()
+                .logout()
+                .await
+                .unwrap(),
+            "已确认注销校园网"
+        );
+        let calls = requests(server).await;
+        assert_eq!(calls.len(), 3);
+        assert_eq!(calls[0].path(), "/cgi-bin/rad_user_info");
+        assert_eq!(calls[2].path(), "/cgi-bin/rad_user_info");
+        let params: std::collections::HashMap<_, _> = calls[1].query_pairs().into_owned().collect();
+        assert_eq!(params["action"], "logout");
+        assert_eq!(params["username"], config.username);
+        assert_eq!(params["ip"], "10.20.30.40");
+        assert_eq!(params["ac_id"], "17");
+        assert!(!params.contains_key("password") && !params.contains_key("info"));
+    }
+
+    #[tokio::test]
+    async fn logout_skips_offline_or_unknown_sessions() {
+        for (body, success) in [
+            (r#"{"error":"not_online_error"}"#, true),
+            (r#"{"error":"busy"}"#, false),
+        ] {
+            let (config, server) = mock_portal(vec![(200, body)]).await;
+            assert_eq!(
+                SrunClient::new(&config)
+                    .await
+                    .unwrap()
+                    .logout()
+                    .await
+                    .is_ok(),
+                success
+            );
+            assert_eq!(requests(server).await.len(), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn logout_does_not_treat_rejection_or_http_failure_as_success() {
+        for (reply, expected) in [
+            ((200, r#"{"error":"ok"}"#), "仍显示在线"),
+            ((503, "unavailable"), "无法确认注销结果"),
+        ] {
+            let (config, server) = mock_portal(vec![
+                (200, r#"{"error":"ok"}"#),
+                (200, r#"{"error":"logout_error"}"#),
+                reply,
+                reply,
+                reply,
+            ])
+            .await;
+            let error = SrunClient::new(&config)
+                .await
+                .unwrap()
+                .logout()
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains(expected), "{error:#}");
+            let calls = requests(server).await;
+            assert_eq!(
+                calls
+                    .iter()
+                    .filter(|url| url.path() == "/cgi-bin/srun_portal")
+                    .count(),
+                1
+            );
+        }
     }
 
     #[tokio::test]

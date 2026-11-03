@@ -41,6 +41,16 @@ impl Service {
 }
 
 impl Controller {
+    pub async fn logout(&self, config: &crate::config::Config) -> Result<&'static str> {
+        self.stop().await.context("停止服务失败，未发送注销请求")?;
+        tokio::time::timeout(Duration::from_secs(20), async {
+            crate::client::SrunClient::new(config).await?.logout().await
+        })
+        .await
+        .context("服务已停止，但注销操作超时，无法确认注销结果")?
+        .context("服务已停止，不会自动重连")
+    }
+
     async fn command(&self, arguments: &[&str]) -> Result<String> {
         let mut command = Command::new(&self.executable);
         command.arg("--system").args(arguments).kill_on_drop(true);
@@ -263,6 +273,9 @@ if 'start' in args:
             sys.exit(1)
         time.sleep(12)
 elif 'stop' in args:
+    if mode == 'stop_error':
+        print('stop request failed', file=sys.stderr)
+        sys.exit(1)
     stage.write_text('inactive')
 elif 'kill' in args:
     if mode == 'refresh_error':
@@ -466,6 +479,27 @@ elif 'show' in args:
         assert!(controller.inspect().await.unwrap().running());
         let calls = std::fs::read_to_string(directory.path().join("calls")).unwrap();
         assert!(!calls.contains(" stop "));
+    }
+
+    #[tokio::test]
+    async fn logout_stops_before_network_requests_and_keeps_service_stopped_on_failure() {
+        for mode in ["ready", "stop_error"] {
+            let (directory, controller) = fixture(mode);
+            std::fs::write(directory.path().join("stage"), "active").unwrap();
+            // Parsing this invalid Portal fails before any external request can be sent.
+            let config = crate::config::Config::default();
+            let error = controller.logout(&config).await.unwrap_err();
+            if mode == "stop_error" {
+                assert!(error.to_string().contains("未发送注销请求"));
+                assert!(controller.inspect().await.unwrap().running());
+            } else {
+                assert!(error.to_string().contains("服务已停止，不会自动重连"));
+                assert!(!controller.inspect().await.unwrap().running());
+            }
+            let calls = std::fs::read_to_string(directory.path().join("calls")).unwrap();
+            assert!(calls.contains(" stop "));
+            assert!(!calls.contains(" start "));
+        }
     }
 
     #[tokio::test]

@@ -274,11 +274,42 @@ def backend_tests(binary):
     print("Daemon startup, fallback, failure threshold, staged retries, outage recovery, pause, periodic checks, and stop: PASS")
 
 def tui_tests(test_binary):
+    class DiscoveryPortal(http.server.BaseHTTPRequestHandler):
+        hanging = False
+        calls = 0
+
+        def do_GET(self):
+            assert self.path == "/", self.path
+            DiscoveryPortal.calls += 1
+            if DiscoveryPortal.hanging:
+                time.sleep(1)
+            body = b"<script>var ac_id=37;</script><p>SRUN online</p>"
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            try:
+                self.wfile.write(body)
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+
+        def log_message(self, *_):
+            pass
+
+    with http.server.ThreadingHTTPServer(("127.0.0.1", 0), DiscoveryPortal) as server:
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        try:
+            _tui_tests(test_binary, server, DiscoveryPortal)
+        finally:
+            server.shutdown()
+
+
+def _tui_tests(test_binary, server, handler):
+    portal = f"http://127.0.0.1:{server.server_port}"
     with tempfile.TemporaryDirectory(prefix="netkeeper-tui-") as directory:
         root = Path(directory)
         configuration = root / "config.toml"
         configuration.write_text(
-            "username='fixture'\npassword='visible-old'\nportal_url='http://127.0.0.1'\n"
+            f"username='fixture'\npassword='visible-old'\nportal_url='{portal}'\n"
             "ac_id=24\ninterface='missing-test0'\n"
         )
         for save in (True, False):
@@ -317,6 +348,15 @@ def tui_tests(test_binary):
                     send(b"\x1b[B\r\x15updated-user\r")
                     send(b"\x1b[B\r\x15" + "plain-pass-测试123".encode() + b"\r")
                     assert "plain-pass-测试123" in output.decode(errors="replace")
+                    send(b"\x1b[H" + b"\x1b[B" * 8 + b"\r")  # Auto-discover from known Portal.
+                    wait_for(lambda: handler.calls == 1)
+                    drain(0.2)
+                    assert "ac_id=37" in output.decode(errors="replace")
+                    send(b"\r")  # Confirm detected parameters.
+                    assert "接入点 ac_id：37" in output.decode(errors="replace")
+                    send(b"\x1b[B\r" + (portal + "/srun_portal_pc?ac_id=42").encode() + b"\r")
+                    assert "ac_id=42" in output.decode(errors="replace")
+                    send(b"\r")  # Confirm imported parameters; no extra HTTP request.
                     send(b"\x1b[H" + b"\x1b[B" * 6 + b"\r")  # Probe settings.
                     assert "公网探测设置" in output.decode(errors="replace")
                     send(b"\r\x1b[B\r")  # ICMP -> TCP, using a selector.
@@ -325,6 +365,11 @@ def tui_tests(test_binary):
                     send(b"\x1b[F\r")  # Return without committing yet.
                     send(b"\x1b[F\x1b[A\r")  # Save.
                 else:
+                    handler.hanging = True
+                    send(b"\x1b[H" + b"\x1b[B" * 8 + b"\r")
+                    wait_for(lambda: handler.calls == 2)
+                    send(b"\x1b")  # Cancel discovery while its request is pending.
+                    send(b"\x1b[H")
                     send(b"\x1b[B\r\x15unsaved-value\x1b")  # Cancel edit.
                     send(b"\x1b")  # Cancel settings.
                 process.wait(timeout=3)
@@ -335,6 +380,7 @@ def tui_tests(test_binary):
                     settings = tomllib.loads(configuration.read_text())
                     assert settings["username"] == "updated-user"
                     assert settings["password"] == "plain-pass-测试123"
+                    assert settings["portal_url"] == portal and settings["ac_id"] == 42
                     assert settings["probe"]["mode"] == "tcp"
                     assert settings["probe"]["primary"] == "127.0.0.1"
                     assert len(settings["probe"]["backups"]) == 2
@@ -348,7 +394,8 @@ def tui_tests(test_binary):
                     process.wait()
                 os.close(master)
                 os.close(slave)
-    print("PTY arrows, interface selection, plaintext fields, save/cancel, and terminal restoration: PASS")
+    assert handler.calls == 2
+    print("PTY automatic discovery, URL import, cancellation, settings save and terminal restoration: PASS")
 
 
 def find_test_binary():
@@ -368,7 +415,9 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--binary", type=Path, default=Path("target/debug/netkeeper"))
     parser.add_argument("--test-binary", type=Path)
+    parser.add_argument("--settings-only", action="store_true", help="only test the settings TUI")
     args = parser.parse_args()
     test_binary = args.test_binary or find_test_binary()
-    backend_tests(args.binary.resolve())
+    if not args.settings_only:
+        backend_tests(args.binary.resolve())
     tui_tests(test_binary.resolve())

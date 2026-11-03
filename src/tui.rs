@@ -1,4 +1,5 @@
 use crate::config::{Config, ProbeMode};
+use crate::discovery;
 use anyhow::{ensure, Context, Result};
 use crossterm::{
     cursor::{Hide, MoveTo, Show},
@@ -311,7 +312,7 @@ fn choose_interface(ui: &mut Ui, current: Option<&str>) -> Result<Option<Option<
         .map(|index| names[index].clone()))
 }
 
-pub fn settings(path: &Path) -> Result<bool> {
+pub async fn settings(path: &Path) -> Result<bool> {
     let mut ui = Ui::new()?;
     let mut config = Config::for_edit(path);
     let mut selected = 0;
@@ -328,6 +329,8 @@ pub fn settings(path: &Path) -> Result<bool> {
             format!("Portal 巡检间隔（秒）：{}", config.online_interval_secs),
             "公网探测设置".into(),
             "分阶段重试设置".into(),
+            "自动识别 Portal / ac_id".into(),
+            "从认证页面链接导入".into(),
             "保存配置".into(),
             "取消".into(),
         ];
@@ -339,6 +342,9 @@ pub fn settings(path: &Path) -> Result<bool> {
             0 => {
                 if let Some(value) = choose_interface(&mut ui, config.interface.as_deref())? {
                     config.interface = value;
+                    if config.portal_url.is_empty() || config.ac_id == 0 {
+                        discover_settings(&mut ui, &mut config).await?;
+                    }
                 }
             }
             1..=5 => {
@@ -362,13 +368,62 @@ pub fn settings(path: &Path) -> Result<bool> {
             }
             6 => probe_settings(&mut ui, &mut config)?,
             7 => retry_settings(&mut ui, &mut config)?,
-            8 => match config.save(path) {
+            8 => discover_settings(&mut ui, &mut config).await?,
+            9 => {
+                if let Some(value) = ui.input("完整认证页面链接（含 ac_id）", "")? {
+                    match discovery::from_link(&value) {
+                        Ok(found) => apply_discovery(&mut ui, &mut config, found)?,
+                        Err(error) => ui.message("无法导入", &format!("{error:#}"))?,
+                    }
+                }
+            }
+            10 => match config.save(path) {
                 Ok(()) => return Ok(true),
                 Err(error) => ui.message("配置未保存", &format!("{error:#}"))?,
             },
             _ => return Ok(false),
         }
     }
+}
+
+fn apply_discovery(ui: &mut Ui, config: &mut Config, found: discovery::Parameters) -> Result<()> {
+    if ui.select(
+        "认证参数（回填后仍需保存配置）",
+        &[
+            format!("使用 {}，ac_id={}", found.portal_url, found.ac_id),
+            "取消，保留原参数".into(),
+        ],
+        0,
+    )? == Some(0)
+    {
+        config.portal_url = found.portal_url;
+        config.ac_id = found.ac_id;
+    }
+    Ok(())
+}
+
+async fn discover_settings(ui: &mut Ui, config: &mut Config) -> Result<()> {
+    ui.page(
+        "正在自动识别认证参数",
+        &[
+            format!(
+                "网卡：{}",
+                config.interface.as_deref().unwrap_or("跟随系统路由")
+            ),
+            "只读取认证页面，不会登录或注销".into(),
+        ],
+        "最多 10 秒 · Esc / Ctrl+C 取消",
+    )?;
+    let result = tokio::select! {
+        biased;
+        _ = cancel(true) => return Ok(()),
+        result = discovery::discover(config.interface.as_deref(), &config.portal_url) => result,
+    };
+    match result {
+        Ok(found) => apply_discovery(ui, config, found)?,
+        Err(error) => ui.message("未能自动识别（原参数保留）", &format!("{error:#}"))?,
+    }
+    Ok(())
 }
 
 fn number<T: std::str::FromStr + std::fmt::Display>(
@@ -508,11 +563,11 @@ fn retry_settings(ui: &mut Ui, config: &mut Config) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    #[test]
+    #[tokio::test]
     #[ignore = "driven through a PTY by tests/behavior.py"]
-    fn interactive_settings_fixture() {
+    async fn interactive_settings_fixture() {
         let path = std::path::PathBuf::from(std::env::var_os("NETKEEPER_UI_TEST_CONFIG").unwrap());
         let expected = std::env::var("NETKEEPER_UI_TEST_SAVED").unwrap() == "yes";
-        assert_eq!(super::settings(&path).unwrap(), expected);
+        assert_eq!(super::settings(&path).await.unwrap(), expected);
     }
 }
