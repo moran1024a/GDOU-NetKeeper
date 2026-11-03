@@ -1,15 +1,15 @@
 # GDOU NetKeeper
 
 Linux SRUN 校园网认证服务，目标平台 Ubuntu 24.04，支持有线、Wi-Fi 和网卡绑定。
-v0.3.0 提供终端菜单、快速连通性探测和自动恢复，由 systemd 管理后台进程。
+v0.3.1 提供终端菜单、快速连通性探测和自动恢复，由 systemd 管理后台进程。
 
 ## 安装与使用
 
 从 [Releases](https://github.com/moran1024a/GDOU-NetKeeper/releases) 下载 `.deb` 和 `.deb.sha256`，放在同一目录校验并安装：
 
 ```bash
-sha256sum -c gdou-netkeeper_0.3.0-1_amd64.deb.sha256
-sudo apt install ./gdou-netkeeper_0.3.0-1_amd64.deb
+sha256sum -c gdou-netkeeper_0.3.1-1_amd64.deb.sha256
+sudo apt install ./gdou-netkeeper_0.3.1-1_amd64.deb
 sudo netkeeper
 ```
 
@@ -41,7 +41,8 @@ sudo netkeeper
 恢复阶段统一按 **5 秒 × 3 次 → 15 秒 × 3 次 → 持续 30 秒**重试；等待从本轮结束后计算。
 期间暂停普通轮询，重复 `start` 也不会绕过等待；恢复时确认公网探测通过后重置计数。
 明确识别的凭据错误会暂停自动请求，修改配置并重启后恢复；未知错误仍按退避重试。
-`status` 显示最近探测、连续失败轮数、恢复尝试次数和下次重试时间。
+服务运行时，普通用户可用 `status` 查看最近探测、连续失败轮数、恢复尝试次数和下次重试时间。
+停止后自动清理运行状态文件；历史记录通过 `journalctl -u netkeeper` 查看。
 
 在设置中可修改各项间隔、超时、失败门槛，切换 ICMP / TCP，编辑主目标及最多三个可选备用目标。
 目标使用 IPv4 地址；TCP 模式的所有目标使用同一可配置端口，默认 53。全部探测绑定所选网卡。

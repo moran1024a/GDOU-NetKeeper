@@ -12,7 +12,8 @@ TimeoutStartSec=35s
 TimeoutStopSec=5s
 RuntimeDirectory=netkeeper
 RuntimeDirectoryMode=0755
-RuntimeDirectoryPreserve=yes
+# Preserve=no keeps this non-secret status directory outside /run/private.
+RuntimeDirectoryPreserve=no
 # systemd reads the root-only config and supplies it to a temporary service user.
 DynamicUser=yes
 LoadCredential=config:/etc/netkeeper/config.toml

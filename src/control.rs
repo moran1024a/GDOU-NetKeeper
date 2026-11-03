@@ -156,16 +156,19 @@ impl Controller {
         let owned = !before.running();
         let baseline = State::read(&self.state_dir);
         let refresh = before.active == "active";
-        if owned {
-            if before.active == "failed" {
-                self.command(&["reset-failed", UNIT]).await?;
-            }
-            self.command(&["--no-block", "start", UNIT]).await?;
-        } else if refresh {
-            self.command(&["kill", "--signal=SIGUSR1", "--kill-whom=main", UNIT])
-                .await?;
-        }
+        let mut start_requested = false;
         let waiting = async {
+            if owned {
+                if before.active == "failed" {
+                    self.command(&["reset-failed", UNIT]).await?;
+                }
+                // systemd may accept the job even if systemctl later fails or times out.
+                start_requested = true;
+                self.command(&["--no-block", "start", UNIT]).await?;
+            } else if refresh {
+                self.command(&["kill", "--signal=SIGUSR1", "--kill-whom=main", UNIT])
+                    .await?;
+            }
             let mut previous = String::new();
             let mut seen_running = before.running();
             loop {
@@ -226,7 +229,7 @@ impl Controller {
             _ = cancel => Err(anyhow::anyhow!("启动已取消")),
             result = tokio::time::timeout(self.timeout, waiting) => result.unwrap_or_else(|_| Err(anyhow::anyhow!("等待在线超时，启动未成功"))),
         };
-        if result.is_err() && owned {
+        if result.is_err() && start_requested {
             self.stop()
                 .await
                 .context("启动失败后停止服务失败，请执行 netkeeper stop")?;
@@ -253,9 +256,18 @@ value = stage.read_text() if stage.exists() else 'inactive'
 mode = (root / 'mode').read_text()
 if 'start' in args:
     stage.write_text('activating')
+    if mode in ['start_error', 'start_timeout']:
+        stage.write_text('active')
+        if mode == 'start_error':
+            print('start request failed after acceptance', file=sys.stderr)
+            sys.exit(1)
+        time.sleep(12)
 elif 'stop' in args:
     stage.write_text('inactive')
 elif 'kill' in args:
+    if mode == 'refresh_error':
+        print('refresh request failed', file=sys.stderr)
+        sys.exit(1)
     path = root / 'status.json'
     if path.exists():
         state = json.loads(path.read_text())
@@ -378,5 +390,127 @@ elif 'show' in args:
             .await
             .is_err());
         assert!(controller.inspect().await.unwrap().running());
+    }
+
+    #[tokio::test]
+    async fn accepted_start_request_errors_and_command_timeouts_are_stopped() {
+        for (mode, message) in [
+            ("start_error", "start request failed after acceptance"),
+            ("start_timeout", "systemd 管理请求超时"),
+        ] {
+            let (directory, mut controller) = fixture(mode);
+            controller.timeout = Duration::from_secs(10);
+            let error = controller
+                .start(std::future::pending(), |_| Ok(()))
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains(message), "{mode}: {error:#}");
+            let calls = std::fs::read_to_string(directory.path().join("calls")).unwrap();
+            assert!(calls.contains("--system stop netkeeper.service"));
+            assert!(!controller.inspect().await.unwrap().running());
+        }
+    }
+
+    #[tokio::test]
+    async fn cancellation_and_overall_timeout_during_start_request_are_stopped() {
+        for cancelled in [true, false] {
+            let (directory, controller) = fixture("start_timeout");
+            let cancel = async {
+                if !cancelled {
+                    std::future::pending::<()>().await;
+                }
+                while std::fs::read_to_string(directory.path().join("stage")).unwrap_or_default()
+                    != "active"
+                {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            };
+            let error = controller.start(cancel, |_| Ok(())).await.unwrap_err();
+            assert!(error.to_string().contains(if cancelled {
+                "启动已取消"
+            } else {
+                "等待在线超时"
+            }));
+            let calls = std::fs::read_to_string(directory.path().join("calls")).unwrap();
+            assert!(calls.contains("--system stop netkeeper.service"));
+            assert!(!controller.inspect().await.unwrap().running());
+        }
+    }
+
+    #[tokio::test]
+    async fn cancellation_before_start_request_does_not_start_or_stop_service() {
+        let (directory, controller) = fixture("ready");
+        let error = controller
+            .start(std::future::ready(()), |_| Ok(()))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("启动已取消"));
+        let calls = std::fs::read_to_string(directory.path().join("calls")).unwrap();
+        assert!(!calls.contains(" start "));
+        assert!(!calls.contains(" stop "));
+    }
+
+    #[tokio::test]
+    async fn refresh_request_error_preserves_existing_service() {
+        let (directory, controller) = fixture("ready");
+        controller
+            .start(std::future::pending(), |_| Ok(()))
+            .await
+            .unwrap();
+        std::fs::write(directory.path().join("mode"), "refresh_error").unwrap();
+        let error = controller
+            .start(std::future::pending(), |_| Ok(()))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("refresh request failed"));
+        assert!(controller.inspect().await.unwrap().running());
+        let calls = std::fs::read_to_string(directory.path().join("calls")).unwrap();
+        assert!(!calls.contains(" stop "));
+    }
+
+    #[tokio::test]
+    async fn status_reads_full_snapshot_and_handles_removed_runtime_directory() {
+        let (directory, mut controller) = fixture("ready");
+        std::fs::write(directory.path().join("stage"), "active").unwrap();
+        controller.state_dir = directory.path().join("runtime");
+        std::fs::create_dir(&controller.state_dir).unwrap();
+        let mut state = State::new(Some("test0".into()));
+        state.pid = 123;
+        state.probe = Some(crate::probe::ProbeResult {
+            checked_at: state::now(),
+            reachable: false,
+            detail: "全部目标不可达".into(),
+        });
+        state.probe_failures = 3;
+        state.recovery_attempts = 2;
+        state.next_retry_at = Some(state::now() + 30);
+        state
+            .update(&controller.state_dir, Phase::Retrying, "等待恢复")
+            .unwrap();
+        assert_eq!(
+            std::fs::metadata(controller.state_dir.join("status.json"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o644
+        );
+        let status = controller.status().await.unwrap();
+        for expected in [
+            "网卡：test0",
+            "等待恢复",
+            "全部目标不可达",
+            "连续失败：3 轮",
+            "恢复尝试：2 次",
+            "下次重试：约",
+        ] {
+            assert!(status.contains(expected), "{status}");
+        }
+        controller.stop().await.unwrap();
+        std::fs::remove_dir_all(&controller.state_dir).unwrap();
+        let stopped = controller.status().await.unwrap();
+        assert!(stopped.contains("服务：已停止"));
+        assert!(stopped.contains("当前联网状态未检测"));
+        assert!(!stopped.contains("下次重试"));
     }
 }
