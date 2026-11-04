@@ -8,11 +8,12 @@ use std::path::Path;
 
 pub const CONFIG_PATH: &str = "/etc/netkeeper/config.toml";
 
-#[derive(Deserialize, Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
     pub username: String,
     pub password: String,
+    pub auth_mode: AuthMode,
     pub portal_url: String,
     pub ac_id: u32,
     pub interface: Option<String>,
@@ -22,6 +23,14 @@ pub struct Config {
     pub _legacy_retry_interval_secs: Option<u64>,
     pub retry_intervals_secs: [u64; 3],
     pub probe: ProbeConfig,
+}
+
+#[derive(Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum AuthMode {
+    #[default]
+    Auto,
+    Manual,
 }
 
 #[derive(Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
@@ -66,6 +75,7 @@ impl Default for Config {
         Self {
             username: String::new(),
             password: String::new(),
+            auth_mode: AuthMode::Auto,
             portal_url: String::new(),
             ac_id: 0,
             interface: None,
@@ -127,18 +137,20 @@ impl Config {
         if self.password.is_empty() {
             bail!("password 不能为空");
         }
-        let url = Url::parse(&self.portal_url).context("portal_url 不是有效 URL")?;
-        if !matches!(url.scheme(), "http" | "https")
-            || url.host_str().is_none()
-            || !url.username().is_empty()
-            || url.password().is_some()
-            || url.path() != "/"
-            || url.query().is_some()
-            || url.fragment().is_some()
-        {
-            bail!("portal_url 只接受 http(s)://主机[:端口]，不要带账号、页面路径或查询参数");
+        if !self.portal_url.is_empty() || self.auth_mode == AuthMode::Manual {
+            let url = Url::parse(&self.portal_url).context("portal_url 不是有效 URL")?;
+            if !matches!(url.scheme(), "http" | "https")
+                || url.host_str().is_none()
+                || !url.username().is_empty()
+                || url.password().is_some()
+                || url.path() != "/"
+                || url.query().is_some()
+                || url.fragment().is_some()
+            {
+                bail!("portal_url 只接受 http(s)://主机[:端口]，不要带账号、页面路径或查询参数");
+            }
         }
-        if self.ac_id == 0 {
+        if self.auth_mode == AuthMode::Manual && self.ac_id == 0 {
             bail!("ac_id 必须大于 0");
         }
         if let Some(interface) = &self.interface {

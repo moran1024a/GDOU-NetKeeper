@@ -13,9 +13,15 @@ const PROBES: [(&str, &str); 2] = [
     ("neverssl.com", "/"),
 ];
 
+#[derive(Clone)]
 pub struct Parameters {
     pub portal_url: String,
     pub ac_id: u32,
+}
+
+pub enum Detection {
+    Captive(Parameters),
+    Online,
 }
 
 // Discovery only reads pages. Never follow authentication actions or run page scripts.
@@ -143,22 +149,28 @@ fn page_links(base: &Url, body: &str) -> Vec<Url> {
         .collect()
 }
 
-pub async fn discover(interface: Option<&str>, portal_hint: &str) -> Result<Parameters> {
-    let mut seeds = Vec::new();
-    if !portal_hint.trim().is_empty() {
-        seeds.push(page_url(portal_hint.trim())?);
+pub async fn discover(interface: Option<&str>) -> Result<Parameters> {
+    match detect(interface).await? {
+        Detection::Captive(parameters) => Ok(parameters),
+        Detection::Online => {
+            bail!("公网已连通，没有未认证跳转；接入参数将在掉认证后确认，也可手动导入当前认证链接")
+        }
     }
-    seeds.extend(
-        PROBES
-            .iter()
-            .map(|(host, path)| Url::parse(&format!("http://{host}{path}")).expect("probe URL")),
-    );
+}
+
+pub async fn detect(interface: Option<&str>) -> Result<Detection> {
+    // Only a fresh redirect from this interface's public path identifies its AC.
+    // A saved Portal root may redirect to a generic, unrelated access point.
+    let seeds = PROBES
+        .iter()
+        .map(|(host, path)| Url::parse(&format!("http://{host}{path}")).expect("probe URL"))
+        .collect();
     tokio::time::timeout(TIMEOUT, discover_at(interface, seeds))
         .await
         .context("自动识别超过 10 秒，请粘贴认证页面链接或手动填写")?
 }
 
-async fn discover_at(interface: Option<&str>, seeds: Vec<Url>) -> Result<Parameters> {
+async fn discover_at(interface: Option<&str>, seeds: Vec<Url>) -> Result<Detection> {
     let mut pending: VecDeque<_> = seeds.into();
     let mut visited = HashSet::new();
     let mut last_error = None;
@@ -170,7 +182,7 @@ async fn discover_at(interface: Option<&str>, seeds: Vec<Url>) -> Result<Paramet
             continue;
         }
         if let Some(ac_id) = query_id(&url) {
-            return Ok(parameters(&url, ac_id));
+            return Ok(Detection::Captive(parameters(&url, ac_id)));
         }
         let response = async {
             let (http, _) = bound_http(&url, interface).await?;
@@ -198,7 +210,7 @@ async fn discover_at(interface: Option<&str>, seeds: Vec<Url>) -> Result<Paramet
                 .and_then(|url| page_url(url.as_str()).ok())
             {
                 if let Some(ac_id) = query_id(&target) {
-                    return Ok(parameters(&target, ac_id));
+                    return Ok(Detection::Captive(parameters(&target, ac_id)));
                 }
                 pending.push_front(target);
             }
@@ -211,6 +223,9 @@ async fn discover_at(interface: Option<&str>, seeds: Vec<Url>) -> Result<Paramet
                 continue;
             }
         };
+        if url.host_str() == Some(PROBES[0].0) && body.trim() == "Microsoft Connect Test" {
+            return Ok(Detection::Online);
+        }
         let links = page_links(&url, &body);
         let mut found = None;
         for candidate in links
@@ -226,12 +241,12 @@ async fn discover_at(interface: Option<&str>, seeds: Vec<Url>) -> Result<Paramet
             found = Some(candidate);
         }
         if let Some((portal_url, ac_id)) = found {
-            return Ok(Parameters { portal_url, ac_id });
+            return Ok(Detection::Captive(Parameters { portal_url, ac_id }));
         }
         // An intercepted HTTP 200 does not make the public probe host a Portal.
         if !probe_host(&url) && body.to_ascii_lowercase().contains("srun") {
             if let Some(ac_id) = inline_id(&body) {
-                return Ok(parameters(&url, ac_id));
+                return Ok(Detection::Captive(parameters(&url, ac_id)));
             }
         }
         for link in links.into_iter().rev().take(REQUEST_LIMIT) {
@@ -241,5 +256,5 @@ async fn discover_at(interface: Option<&str>, seeds: Vec<Url>) -> Result<Paramet
     let detail = last_error
         .map(|e| format!("；最近错误：{e:#}"))
         .unwrap_or_default();
-    bail!("未找到完整认证参数；已在线时可能没有认证跳转，请填写已知 Portal 后再识别，或粘贴认证页面链接{detail}")
+    bail!("未从当前网卡的认证跳转取得完整参数；请检查网络，或切换手动模式填写当前认证参数{detail}")
 }

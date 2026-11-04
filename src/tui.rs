@@ -1,4 +1,4 @@
-use crate::config::{Config, ProbeMode};
+use crate::config::{AuthMode, Config, ProbeMode};
 use crate::discovery;
 use anyhow::{ensure, Context, Result};
 use crossterm::{
@@ -324,13 +324,37 @@ pub async fn settings(path: &Path) -> Result<bool> {
             ),
             format!("账号：{}", config.username),
             format!("密码：{}", config.password),
-            format!("Portal：{}", config.portal_url),
-            format!("接入点 ac_id：{}", config.ac_id),
+            format!(
+                "Portal{}：{}",
+                if config.auth_mode == AuthMode::Auto {
+                    "（可选提示）"
+                } else {
+                    ""
+                },
+                config.portal_url
+            ),
+            format!(
+                "接入点 ac_id{}：{}",
+                if config.auth_mode == AuthMode::Auto {
+                    "（自动模式不固定使用）"
+                } else {
+                    ""
+                },
+                config.ac_id
+            ),
             format!("Portal 巡检间隔（秒）：{}", config.online_interval_secs),
             "公网探测设置".into(),
             "分阶段重试设置".into(),
             "自动识别 Portal / ac_id".into(),
             "从认证页面链接导入".into(),
+            format!(
+                "认证参数模式：{}",
+                if config.auth_mode == AuthMode::Auto {
+                    "自动识别（推荐）"
+                } else {
+                    "手动指定"
+                }
+            ),
             "保存配置".into(),
             "取消".into(),
         ];
@@ -342,7 +366,9 @@ pub async fn settings(path: &Path) -> Result<bool> {
             0 => {
                 if let Some(value) = choose_interface(&mut ui, config.interface.as_deref())? {
                     config.interface = value;
-                    if config.portal_url.is_empty() || config.ac_id == 0 {
+                    if config.auth_mode == AuthMode::Manual
+                        && (config.portal_url.is_empty() || config.ac_id == 0)
+                    {
                         discover_settings(&mut ui, &mut config).await?;
                     }
                 }
@@ -374,7 +400,23 @@ pub async fn settings(path: &Path) -> Result<bool> {
                     }
                 }
             }
-            10 => match config.save(path) {
+            10 => {
+                if let Some(choice) = ui.select(
+                    "认证参数模式",
+                    &[
+                        "自动识别：掉认证后从当前网卡重新获取".into(),
+                        "手动指定：始终使用填写的 Portal / ac_id".into(),
+                    ],
+                    usize::from(config.auth_mode == AuthMode::Manual),
+                )? {
+                    config.auth_mode = if choice == 0 {
+                        AuthMode::Auto
+                    } else {
+                        AuthMode::Manual
+                    };
+                }
+            }
+            11 => match config.save(path) {
                 Ok(()) => return Ok(true),
                 Err(error) => ui.message("配置未保存", &format!("{error:#}"))?,
             },
@@ -385,7 +427,7 @@ pub async fn settings(path: &Path) -> Result<bool> {
 
 fn apply_discovery(ui: &mut Ui, config: &mut Config, found: discovery::Parameters) -> Result<()> {
     if ui.select(
-        "认证参数（回填后仍需保存配置）",
+        "认证参数（回填后仍需保存；自动模式下次掉认证仍会重新识别）",
         &[
             format!("使用 {}，ac_id={}", found.portal_url, found.ac_id),
             "取消，保留原参数".into(),
@@ -414,7 +456,7 @@ async fn discover_settings(ui: &mut Ui, config: &mut Config) -> Result<()> {
     let result = tokio::select! {
         biased;
         _ = cancel(true) => return Ok(()),
-        result = discovery::discover(config.interface.as_deref(), &config.portal_url) => result,
+        result = discovery::discover(config.interface.as_deref()) => result,
     };
     match result {
         Ok(found) => apply_discovery(ui, config, found)?,

@@ -2,7 +2,10 @@
 username = ""
 password = ""
 
-# Portal 根地址及接入点编号。
+# auto：每次掉认证后从所选网卡的认证跳转识别；manual：固定使用填写的参数。
+auth_mode = "auto"
+# 自动模式允许留空；已有 Portal 仅用于状态查询，旧 ac_id 不用于自动登录。
+# 手动模式必须填写有效的 Portal 根地址和正整数 ac_id。
 portal_url = ""
 ac_id = 0
 

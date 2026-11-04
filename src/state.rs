@@ -25,6 +25,10 @@ pub struct State {
     pub pid: u32,
     pub phase: Phase,
     pub interface: Option<String>,
+    #[serde(default)]
+    pub portal_url: Option<String>,
+    #[serde(default)]
+    pub ac_id: Option<u32>,
     pub checked_at: u64,
     #[serde(default)]
     pub generation: u64,
@@ -45,6 +49,8 @@ impl State {
             pid: std::process::id(),
             phase: Phase::Starting,
             interface,
+            portal_url: None,
+            ac_id: None,
             checked_at: 0,
             generation: 0,
             detail: "正在启动".into(),

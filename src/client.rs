@@ -14,7 +14,6 @@ use std::{
 const AUTH_TIMEOUT: Duration = Duration::from_secs(5);
 const PROBE_TIMEOUT: Duration = Duration::from_millis(1500);
 const MAX_BODY: usize = 64 * 1024;
-const PROBE_URL: &str = "http://www.msftconnecttest.com/connecttest.txt";
 
 #[derive(Debug)]
 pub struct CredentialRejected(String);
@@ -27,6 +26,17 @@ impl std::fmt::Display for CredentialRejected {
 
 impl std::error::Error for CredentialRejected {}
 
+#[derive(Debug)]
+pub struct AccessRejected(String);
+
+impl std::fmt::Display for AccessRejected {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for AccessRejected {}
+
 fn rejection(value: &Value, config: &Config, secrets: &[&str]) -> anyhow::Error {
     let detail = portal_error(value, config, secrets);
     // Only explicit, known account errors pause authentication. Unknown server
@@ -34,6 +44,14 @@ fn rejection(value: &Value, config: &Config, secrets: &[&str]) -> anyhow::Error 
     match value["error"].as_str().unwrap_or_default() {
         "password_error" | "username_error" | "user_not_exist" | "user_disabled"
         | "account_disabled" => CredentialRejected(detail).into(),
+        "login_error"
+            if matches!(
+                value["error_msg"].as_str(),
+                Some("Nas type not found." | "CHALLENGE failed, BAS respond timeout.")
+            ) =>
+        {
+            AccessRejected(detail).into()
+        }
         _ => anyhow::anyhow!(detail),
     }
 }
@@ -41,7 +59,7 @@ fn rejection(value: &Value, config: &Config, secrets: &[&str]) -> anyhow::Error 
 pub struct SrunClient<'a> {
     config: &'a Config,
     http: Client,
-    ip: Ipv4Addr,
+    pub ip: Ipv4Addr,
 }
 
 impl<'a> SrunClient<'a> {
@@ -51,13 +69,44 @@ impl<'a> SrunClient<'a> {
         Ok(Self { config, http, ip })
     }
 
-    pub async fn cycle(&self) -> Result<bool> {
-        if self.online().await {
-            return Ok(true);
+    pub async fn status(&self) -> Result<Value> {
+        self.api("rad_user_info", &[], PROBE_TIMEOUT)
+            .await
+            .context("查询在线状态失败")
+    }
+
+    pub fn status_detail(&self, state: &Value) -> String {
+        portal_error(state, self.config, &[])
+    }
+
+    pub fn check_account(&self, state: &Value) -> Result<()> {
+        if let Some(username) = state["user_name"].as_str().filter(|s| !s.is_empty()) {
+            if username != self.config.username {
+                bail!("在线账号与当前会话账号不一致，未切换或注销账号");
+            }
         }
-        self.login().await?;
-        // The login response alone does not prove the connection is online.
-        Ok(self.online().await)
+        Ok(())
+    }
+
+    pub async fn confirm_online(&self) -> Result<Value> {
+        let mut detail = String::new();
+        for attempt in 0..3 {
+            if attempt > 0 {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+            match self.status().await {
+                Ok(state) => match protocol::status(&state) {
+                    Status::Online => {
+                        self.check_account(&state)?;
+                        return Ok(state);
+                    }
+                    Status::Offline => detail = "状态接口仍报告离线".into(),
+                    Status::Unknown => detail = portal_error(&state, self.config, &[]),
+                },
+                Err(error) => detail = format!("{error:#}"),
+            }
+        }
+        bail!("登录已被接受，但三次确认仍未证实在线：{detail}")
     }
 
     pub async fn logout(&self) -> Result<&'static str> {
@@ -69,6 +118,13 @@ impl<'a> SrunClient<'a> {
             Status::Offline => return Ok("当前已经离线，无需注销"),
             Status::Unknown => bail!("认证状态无法识别，未发送注销请求"),
             Status::Online => {}
+        }
+        self.check_account(&state)?;
+        if state["user_name"].as_str().is_none_or(|s| s.is_empty()) {
+            bail!("状态接口缺少在线账号，未发送注销请求");
+        }
+        if self.config.ac_id == 0 {
+            bail!("当前会话的 ac_id 尚未确认，未发送注销请求；请手动确认当前认证参数");
         }
         // The Portal may see a translated address when the selected link uses NAT.
         let ip = match state.get("online_ip").and_then(Value::as_str) {
@@ -121,26 +177,10 @@ impl<'a> SrunClient<'a> {
         bail!("无法确认注销结果：{detail}")
     }
 
-    async fn online(&self) -> bool {
-        match self.api("rad_user_info", &[], PROBE_TIMEOUT).await {
-            Ok(value) => match protocol::status(&value) {
-                Status::Online => return true,
-                Status::Offline => return false,
-                Status::Unknown => {}
-            },
-            Err(error) => eprintln!("状态接口暂不可用：{error:#}"),
+    pub async fn login(&self) -> Result<()> {
+        if self.config.ac_id == 0 {
+            bail!("接入点参数尚未确认，未发送登录请求");
         }
-        // Only fall back on an unknown/error status. A captive portal's HTTP 200 is not enough.
-        let response = self.http.get(PROBE_URL).timeout(PROBE_TIMEOUT).send().await;
-        match response {
-            Ok(response) => read_body(response)
-                .await
-                .is_ok_and(|body| body.trim() == "Microsoft Connect Test"),
-            Err(_) => false,
-        }
-    }
-
-    async fn login(&self) -> Result<()> {
         let ip = self.ip.to_string();
         let ac_id = self.config.ac_id.to_string();
         let challenge = self
@@ -225,8 +265,11 @@ impl<'a> SrunClient<'a> {
             // reqwest errors otherwise include the full URL, including login secrets.
             .map_err(reqwest::Error::without_url)
             .with_context(|| format!("{endpoint} 请求失败"))?;
-        let body = read_body(response).await?;
+        let body = read_body(response)
+            .await
+            .with_context(|| format!("{endpoint} 响应读取失败"))?;
         protocol::parse_response(&body, &callback)
+            .with_context(|| format!("{endpoint} 响应解析失败"))
     }
 }
 
@@ -286,7 +329,7 @@ pub(crate) async fn bound_http(
     Ok((builder.build().context("无法创建 HTTP 客户端")?, ip))
 }
 
-fn outbound_ip(destination: SocketAddr, interface: Option<&str>) -> Result<Ipv4Addr> {
+pub(crate) fn outbound_ip(destination: SocketAddr, interface: Option<&str>) -> Result<Ipv4Addr> {
     let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
     if let Some(interface) = interface {
         socket

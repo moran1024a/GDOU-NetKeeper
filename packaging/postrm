@@ -10,6 +10,14 @@ case "$1" in
         deb-systemd-helper unmask netkeeper.service >/dev/null || true
         rm -f "${DPKG_ROOT:-}/run/netkeeper/status.json"
         rmdir "${DPKG_ROOT:-}/run/netkeeper" 2>/dev/null || true
+        if [ -L "${DPKG_ROOT:-}/var/lib/netkeeper" ]; then
+            rm -f "${DPKG_ROOT:-}/var/lib/private/netkeeper/session.json"
+            rm -f "${DPKG_ROOT:-}/var/lib/netkeeper"
+            rmdir "${DPKG_ROOT:-}/var/lib/private/netkeeper" 2>/dev/null || true
+        else
+            rm -f "${DPKG_ROOT:-}/var/lib/netkeeper/session.json"
+            rmdir "${DPKG_ROOT:-}/var/lib/netkeeper" 2>/dev/null || true
+        fi
         ;;
 esac
 

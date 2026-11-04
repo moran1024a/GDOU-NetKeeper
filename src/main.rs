@@ -8,6 +8,7 @@ mod daemon;
 mod discovery;
 mod probe;
 mod protocol;
+mod session;
 mod state;
 mod tui;
 
@@ -96,7 +97,7 @@ async fn start(controller: &Controller) -> Result<()> {
                 ui.page(
                     "正在启动 NetKeeper",
                     &[message.to_owned()],
-                    "等待首次在线，最多 30 秒 · Esc / Ctrl+C 取消",
+                    "等待首次在线，最多 45 秒 · Esc / Ctrl+C 取消",
                 )
             } else {
                 eprintln!("{message}");
@@ -135,9 +136,8 @@ async fn settings(controller: &Controller) -> Result<bool> {
 }
 
 async fn logout(controller: &Controller) -> Result<()> {
-    let config = Config::load(Path::new(CONFIG_PATH))?;
     println!("正在停止服务并注销校园网，此出口的远程连接可能断开");
-    let message = controller.logout(&config).await?;
+    let message = controller.logout().await?;
     println!("{message}；服务保持停止，不会自动重连");
     Ok(())
 }

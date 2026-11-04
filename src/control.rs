@@ -1,5 +1,7 @@
 use crate::{
+    config::{AuthMode, Config, CONFIG_PATH},
     daemon::START_TIMEOUT,
+    session::Session,
     state::{self, Phase, State, STATE_DIR},
 };
 use anyhow::{bail, Context, Result};
@@ -26,10 +28,49 @@ impl Service {
 }
 
 impl Controller {
-    pub async fn logout(&self, config: &crate::config::Config) -> Result<&'static str> {
+    pub async fn logout(&self) -> Result<&'static str> {
+        let before = self.inspect().await?;
+        let snapshot = Session::read();
         self.stop().await.context("停止服务失败，未发送注销请求")?;
+        let snapshot = snapshot.context("服务已停止，无法确认原会话，未发送注销请求")?;
+        // Stop may finish an in-flight state update. The persistent record survives it.
+        let snapshot = Session::read()?.or(snapshot);
+        if before.running() && snapshot.as_ref().is_none_or(|s| s.pid != before.pid) {
+            bail!("服务已停止，但缺少该进程的实际会话记录，未使用新配置注销；请确认当前认证参数");
+        }
+        let mut config = match &snapshot {
+            Some(record) => record.config(),
+            None => Config::load(Path::new(CONFIG_PATH))
+                .context("服务已停止；没有会话记录且配置不可用")?,
+        };
+        // An already-online takeover may not know its AC. Explicit manual input
+        // may fill missing parameters, but must not replace the recorded outlet/account.
+        if let Some(record) = snapshot.as_ref().filter(|s| s.ac_id.is_none()) {
+            if let Ok(manual) = Config::load(Path::new(CONFIG_PATH)) {
+                if manual.auth_mode == AuthMode::Manual
+                    && manual.interface == record.interface
+                    && manual.username == record.username
+                    && (record.portal_url.is_empty() || manual.portal_url == record.portal_url)
+                {
+                    config.portal_url = manual.portal_url;
+                    config.ac_id = manual.ac_id;
+                }
+            }
+        }
+        if snapshot.is_none() && config.auth_mode == AuthMode::Auto {
+            config.ac_id = 0;
+        }
+        if config.portal_url.is_empty() {
+            bail!("服务已停止；当前会话 Portal 尚未确认，未发送注销请求，请手动确认当前认证参数");
+        }
         tokio::time::timeout(Duration::from_secs(20), async {
-            crate::client::SrunClient::new(config).await?.logout().await
+            let client = crate::client::SrunClient::new(&config).await?;
+            if snapshot.as_ref().is_some_and(|s| s.local_ip != client.ip) {
+                bail!("出口 IP 与原会话记录不同，无法确认原登录，未发送注销请求");
+            }
+            let message = client.logout().await?;
+            Session::clear()?;
+            Ok(message)
         })
         .await
         .context("服务已停止，但注销操作超时，无法确认注销结果")?
@@ -96,6 +137,15 @@ impl Controller {
                 state::now().saturating_sub(state.checked_at),
                 state.detail
             ));
+            if let Some(portal) = &state.portal_url {
+                text.push_str(&format!(
+                    "\n实际 Portal：{portal}\n实际 ac_id：{}",
+                    state
+                        .ac_id
+                        .map(|v| v.to_string())
+                        .unwrap_or_else(|| "待确认".into())
+                ));
+            }
             if service.running() && state.pid != service.pid {
                 text.push_str("\n当前进程尚未更新状态，上述为历史记录");
             }

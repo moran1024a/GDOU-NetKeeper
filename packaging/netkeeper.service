@@ -8,7 +8,7 @@ Type=notify
 NotifyAccess=main
 ExecStart=/usr/bin/netkeeper run --config %d/config
 Restart=no
-TimeoutStartSec=35s
+TimeoutStartSec=50s
 TimeoutStopSec=5s
 RuntimeDirectory=netkeeper
 RuntimeDirectoryMode=0755
@@ -16,6 +16,8 @@ RuntimeDirectoryMode=0755
 RuntimeDirectoryPreserve=no
 # systemd reads the root-only config and supplies it to a temporary service user.
 DynamicUser=yes
+StateDirectory=netkeeper
+StateDirectoryMode=0700
 LoadCredential=config:/etc/netkeeper/config.toml
 # Some kernels require this capability for SO_BINDTODEVICE.
 AmbientCapabilities=CAP_NET_RAW

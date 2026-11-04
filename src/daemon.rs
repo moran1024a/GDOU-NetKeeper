@@ -1,10 +1,11 @@
 use crate::{
-    client::{CredentialRejected, SrunClient},
+    client::CredentialRejected,
     config::Config,
     probe,
+    session::Authentication,
     state::{Phase, State},
 };
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result};
 use std::{
     os::{
         linux::net::SocketAddrExt,
@@ -21,7 +22,7 @@ use tokio::{
     time::{Instant, MissedTickBehavior},
 };
 
-pub const START_TIMEOUT: Duration = Duration::from_secs(30);
+pub const START_TIMEOUT: Duration = Duration::from_secs(45);
 pub const START_FAILED: u8 = 78;
 
 // Only systemd launches the daemon. Readiness is sent after the first online check.
@@ -74,6 +75,7 @@ pub async fn run(config_path: &Path, directory: &Path) -> Result<()> {
         tokio::select! { _ = terminate.recv() => {}, _ = interrupt.recv() => {} }
     };
     tokio::pin!(shutdown);
+    let mut authentication = Authentication::new(&config);
 
     let first = tokio::select! {
         biased;
@@ -81,23 +83,27 @@ pub async fn run(config_path: &Path, directory: &Path) -> Result<()> {
             report(&mut state, directory, Phase::Stopped, "启动已取消")?;
             return Ok(());
         },
-        result = tokio::time::timeout(START_TIMEOUT, cycle(&config)) => {
+        result = tokio::time::timeout(START_TIMEOUT, authentication.cycle()) => {
             match result {
                 Ok(result) => result,
-                Err(_) => Err(anyhow::anyhow!("首次认证超过 30 秒，启动已终止")),
+                Err(_) => Err(anyhow::anyhow!("首次认证超过 45 秒，启动已终止")),
             }
         }
     };
-    if let Err(error) = first {
-        report(
-            &mut state,
-            directory,
-            Phase::Failed,
-            &format!("启动失败：{error:#}"),
-        )?;
-        return Err(error);
-    }
-    report(&mut state, directory, Phase::Online, "已确认在线")?;
+    (state.portal_url, state.ac_id) = authentication.parameters();
+    let detail = match first {
+        Err(error) => {
+            report(
+                &mut state,
+                directory,
+                Phase::Failed,
+                &format!("启动失败：{error:#}"),
+            )?;
+            return Err(error);
+        }
+        Ok(detail) => detail,
+    };
+    report(&mut state, directory, Phase::Online, &detail)?;
     notify("READY=1")?;
 
     let interval = Duration::from_secs(config.probe.interval_secs);
@@ -142,8 +148,9 @@ pub async fn run(config_path: &Path, directory: &Path) -> Result<()> {
         let result = tokio::select! {
             biased;
             _ = &mut shutdown => break,
-            result = cycle(&config) => result,
+            result = authentication.cycle() => result,
         };
+        (state.portal_url, state.ac_id) = authentication.parameters();
         // If probes triggered recovery, Portal's online flag alone must not
         // reset the outage: verify the public path after the authentication.
         let result = if result.is_ok()
@@ -157,7 +164,7 @@ pub async fn run(config_path: &Path, directory: &Path) -> Result<()> {
             let reachable = probe.reachable;
             record_probe(&mut state, probe);
             if reachable {
-                Ok(())
+                result
             } else {
                 Err(anyhow::anyhow!(
                     "Portal 报告在线，但公网探测仍失败；不会重复登录，等待复查"
@@ -169,12 +176,12 @@ pub async fn run(config_path: &Path, directory: &Path) -> Result<()> {
 
         probes.reset();
         match result {
-            Ok(()) => {
+            Ok(detail) => {
                 state.recovery_attempts = 0;
                 state.next_retry_at = None;
                 retry_due = None;
                 portal_due = Instant::now() + Duration::from_secs(config.online_interval_secs);
-                report(&mut state, directory, Phase::Online, "已确认在线")?;
+                report(&mut state, directory, Phase::Online, &detail)?;
             }
             Err(error) => {
                 state.recovery_attempts = state.recovery_attempts.saturating_add(1);
@@ -209,13 +216,6 @@ pub async fn run(config_path: &Path, directory: &Path) -> Result<()> {
         "服务已停止，不再巡检或重试",
     )?;
     notify("STOPPING=1")?;
-    Ok(())
-}
-
-async fn cycle(config: &Config) -> Result<()> {
-    if !SrunClient::new(config).await?.cycle().await? {
-        bail!("登录已被接受，但尚未确认在线");
-    }
     Ok(())
 }
 
