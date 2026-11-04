@@ -3,8 +3,10 @@ set -e
 
 if [ "$1" = configure ]; then
     deb-systemd-helper unmask netkeeper.service >/dev/null || true
-    deb-systemd-helper update-state netkeeper.service >/dev/null || true
+    deb-systemd-helper disable netkeeper.service >/dev/null || true
     if [ -z "${DPKG_ROOT:-}" ] && [ -d /run/systemd/system ]; then
+        systemctl --system disable netkeeper.service >/dev/null 2>&1 || true
+        systemctl --system disable --runtime netkeeper.service >/dev/null 2>&1 || true
         systemctl --system daemon-reload || true
         if [ -n "${2:-}" ]; then
             deb-systemd-invoke try-restart netkeeper.service || true

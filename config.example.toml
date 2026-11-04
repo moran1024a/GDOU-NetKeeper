@@ -2,27 +2,41 @@
 username = ""
 password = ""
 
-# auto：每次掉认证后从所选网卡的认证跳转识别；manual：固定使用填写的参数。
+# auto：每次掉认证重新识别；manual：固定使用填写的 Portal 和 ac_id。
 auth_mode = "auto"
-# 自动模式允许留空；已有 Portal 仅用于状态查询，旧 ac_id 不用于自动登录。
-# 手动模式必须填写有效的 Portal 根地址和正整数 ac_id。
 portal_url = ""
 ac_id = 0
+# 可选；省略时跟随系统路由。
+# interface = "enp4s0"
 
-# 可选；省略时使用系统路由。
-# interface = "enp3s0"
-
-# 正常时的 Portal 巡检间隔。
 online_interval_secs = 300
-# 前 3 次重试、接下来 3 次、之后持续使用的等待秒数。
+# 环境未知、网卡断开、校园网出口故障时的复查间隔。
+environment_interval_secs = 30
 retry_intervals_secs = [5, 15, 30]
 
+# 每组 1 主、最多 3 备；主失败才并发探测备用，任一成功即整组成功。
+# 每个目标独立选择 icmp / tcp / https。ICMP 使用 IPv4；其他支持 IPv4 或域名。
+# HTTPS 仅完成 TLS 握手并验证证书，不下载页面，也不依赖 HTTP 状态码。
 [probe]
-mode = "icmp" # 可选 icmp 或 tcp
-primary = "223.5.5.5"
-# 可清空为 []，最多 3 个备用 IPv4；主目标失败后并行检查。
-backups = ["119.29.29.29", "180.76.76.76", "223.6.6.6"]
-tcp_port = 53 # TCP 模式下所有目标使用的端口
+primary = { mode = "icmp", address = "223.5.5.5" }
+backups = [
+    { mode = "icmp", address = "119.29.29.29" },
+    { mode = "icmp", address = "180.76.76.76" },
+    { mode = "icmp", address = "223.6.6.6" },
+]
 interval_secs = 2
 timeout_secs = 1
+https_timeout_secs = 3
 failure_threshold = 3
+
+# 本组所有目标均视为可信校园网目标；用户负责选择符合网络环境的地址。
+[campus_probe]
+primary = { mode = "tcp", address = "210.38.139.41", port = 8081 }
+backups = [
+    { mode = "https", address = "jw.gdou.edu.cn", port = 443 },
+    { mode = "https", address = "kjcrms.gdou.edu.cn", port = 443 },
+]
+interval_secs = 30
+timeout_secs = 1
+https_timeout_secs = 3
+failure_threshold = 1

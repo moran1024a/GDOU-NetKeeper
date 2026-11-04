@@ -59,7 +59,13 @@ async fn main() -> ExitCode {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("错误：{error:#}");
-            ExitCode::from(if backend { daemon::START_FAILED } else { 1 })
+            ExitCode::from(
+                if backend && error.downcast_ref::<daemon::StartupFailed>().is_some() {
+                    daemon::START_FAILED
+                } else {
+                    1
+                },
+            )
         }
     }
 }

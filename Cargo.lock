@@ -377,7 +377,7 @@ dependencies = [
 
 [[package]]
 name = "gdou-netkeeper"
-version = "0.3.4"
+version = "0.3.5"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -393,8 +393,10 @@ dependencies = [
  "socket2",
  "tempfile",
  "tokio",
+ "tokio-rustls",
  "toml",
  "unicode-width",
+ "webpki-roots",
 ]
 
 [[package]]

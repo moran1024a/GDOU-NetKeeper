@@ -23,6 +23,12 @@ pub struct Config {
     pub _legacy_retry_interval_secs: Option<u64>,
     pub retry_intervals_secs: [u64; 3],
     pub probe: ProbeConfig,
+    #[serde(
+        default = "ProbeConfig::campus",
+        deserialize_with = "ProbeConfig::deserialize_campus"
+    )]
+    pub campus_probe: ProbeConfig,
+    pub environment_interval_secs: u64,
 }
 
 #[derive(Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
@@ -38,33 +44,214 @@ pub enum AuthMode {
 pub enum ProbeMode {
     Icmp,
     Tcp,
+    Https,
 }
 
 #[derive(Clone, Deserialize, Serialize)]
-#[serde(default, deny_unknown_fields)]
-pub struct ProbeConfig {
+#[serde(deny_unknown_fields)]
+pub struct ProbeTarget {
     pub mode: ProbeMode,
-    pub primary: Ipv4Addr,
-    pub backups: Vec<Ipv4Addr>,
-    pub tcp_port: u16,
+    pub address: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub port: Option<u16>,
+}
+
+impl ProbeTarget {
+    pub fn port(&self) -> u16 {
+        self.port.unwrap_or(if self.mode == ProbeMode::Https {
+            443
+        } else {
+            53
+        })
+    }
+
+    pub fn label(&self) -> String {
+        match self.mode {
+            ProbeMode::Icmp => format!("ICMP {}", self.address),
+            ProbeMode::Tcp => format!("TCP {}:{}", self.address, self.port()),
+            ProbeMode::Https => format!("HTTPS {}:{}", self.address, self.port()),
+        }
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        if let Ok(ip) = self.address.parse::<Ipv4Addr>() {
+            if ip.is_unspecified() || ip.is_multicast() || ip == Ipv4Addr::BROADCAST {
+                bail!("探测目标必须是单播 IPv4 地址");
+            }
+        } else {
+            if self.mode == ProbeMode::Icmp {
+                bail!("ICMP 目标必须填写 IPv4 地址");
+            }
+            if self.address.len() > 253
+                || !self.address.split('.').all(|label| {
+                    !label.is_empty()
+                        && label.len() <= 63
+                        && !label.starts_with('-')
+                        && !label.ends_with('-')
+                        && label
+                            .bytes()
+                            .all(|c| c.is_ascii_alphanumeric() || c == b'-')
+                })
+            {
+                bail!("TCP / HTTPS 目标须填写 IPv4 或域名，不含协议、路径或端口");
+            }
+        }
+        if self.port() == 0 {
+            bail!("探测端口必须大于 0");
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Serialize)]
+pub struct ProbeConfig {
+    pub primary: ProbeTarget,
+    pub backups: Vec<ProbeTarget>,
     pub interval_secs: u64,
     pub timeout_secs: u64,
+    pub https_timeout_secs: u64,
     pub failure_threshold: u32,
+}
+
+// Accept legacy IPv4 strings and a group-wide mode/port; always save the new format.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum TargetInput {
+    Legacy(Ipv4Addr),
+    Target(ProbeTarget),
+}
+
+#[derive(Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct ProbeInput {
+    mode: Option<ProbeMode>,
+    tcp_port: Option<u16>,
+    primary: Option<TargetInput>,
+    backups: Option<Vec<TargetInput>>,
+    interval_secs: Option<u64>,
+    timeout_secs: Option<u64>,
+    https_timeout_secs: Option<u64>,
+    failure_threshold: Option<u32>,
+}
+
+impl ProbeInput {
+    fn apply(self, mut base: ProbeConfig) -> ProbeConfig {
+        let mode = self.mode.unwrap_or(ProbeMode::Icmp);
+        let convert = |value| match value {
+            TargetInput::Target(value) => value,
+            TargetInput::Legacy(ip) => ProbeTarget {
+                mode,
+                address: ip.to_string(),
+                port: if mode == ProbeMode::Icmp {
+                    None
+                } else {
+                    Some(self.tcp_port.unwrap_or(53))
+                },
+            },
+        };
+        // A legacy group can override mode/port without listing its default addresses.
+        if self.mode.is_some() || self.tcp_port.is_some() {
+            for target in std::iter::once(&mut base.primary).chain(base.backups.iter_mut()) {
+                target.mode = mode;
+                target.port = if mode == ProbeMode::Icmp {
+                    None
+                } else {
+                    Some(self.tcp_port.unwrap_or(53))
+                };
+            }
+        }
+        if let Some(value) = self.primary {
+            base.primary = convert(value);
+        }
+        if let Some(value) = self.backups {
+            base.backups = value.into_iter().map(convert).collect();
+        }
+        if let Some(value) = self.interval_secs {
+            base.interval_secs = value;
+        }
+        if let Some(value) = self.timeout_secs {
+            base.timeout_secs = value;
+        }
+        if let Some(value) = self.https_timeout_secs {
+            base.https_timeout_secs = value;
+        }
+        if let Some(value) = self.failure_threshold {
+            base.failure_threshold = value;
+        }
+        base
+    }
+}
+
+impl<'de> Deserialize<'de> for ProbeConfig {
+    fn deserialize<D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<Self, D::Error> {
+        Ok(ProbeInput::deserialize(deserializer)?.apply(Self::default()))
+    }
+}
+
+impl ProbeConfig {
+    fn deserialize_campus<'de, D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<Self, D::Error> {
+        Ok(ProbeInput::deserialize(deserializer)?.apply(Self::campus()))
+    }
+
+    pub fn campus() -> Self {
+        Self {
+            primary: ProbeTarget {
+                mode: ProbeMode::Tcp,
+                address: "210.38.139.41".into(),
+                port: Some(8081),
+            },
+            backups: ["jw.gdou.edu.cn", "kjcrms.gdou.edu.cn"]
+                .into_iter()
+                .map(|address| ProbeTarget {
+                    mode: ProbeMode::Https,
+                    address: address.into(),
+                    port: Some(443),
+                })
+                .collect(),
+            interval_secs: 30,
+            failure_threshold: 1,
+            ..Self::default()
+        }
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        if !(1..=3600).contains(&self.interval_secs)
+            || !(1..=30).contains(&self.timeout_secs)
+            || !(1..=30).contains(&self.https_timeout_secs)
+            || !(1..=10).contains(&self.failure_threshold)
+        {
+            bail!("探测间隔须为 1–3600 秒，超时为 1–30 秒，失败门槛为 1–10 轮");
+        }
+        if self.backups.len() > 3 {
+            bail!("最多配置 3 个备用目标");
+        }
+        for target in std::iter::once(&self.primary).chain(&self.backups) {
+            target.validate()?;
+        }
+        Ok(())
+    }
 }
 
 impl Default for ProbeConfig {
     fn default() -> Self {
-        Self {
+        let target = |address: &str| ProbeTarget {
             mode: ProbeMode::Icmp,
-            primary: Ipv4Addr::new(223, 5, 5, 5),
-            backups: vec![
-                Ipv4Addr::new(119, 29, 29, 29),
-                Ipv4Addr::new(180, 76, 76, 76),
-                Ipv4Addr::new(223, 6, 6, 6),
-            ],
-            tcp_port: 53,
+            address: address.into(),
+            port: None,
+        };
+        Self {
+            primary: target("223.5.5.5"),
+            backups: ["119.29.29.29", "180.76.76.76", "223.6.6.6"]
+                .into_iter()
+                .map(target)
+                .collect(),
             interval_secs: 2,
             timeout_secs: 1,
+            https_timeout_secs: 3,
             failure_threshold: 3,
         }
     }
@@ -83,6 +270,8 @@ impl Default for Config {
             _legacy_retry_interval_secs: None,
             retry_intervals_secs: [5, 15, 30],
             probe: ProbeConfig::default(),
+            campus_probe: ProbeConfig::campus(),
+            environment_interval_secs: 30,
         }
     }
 }
@@ -163,7 +352,7 @@ impl Config {
                 bail!("interface 必须是有效的 Linux 网卡名称；不绑定时请删除此配置项");
             }
         }
-        for interval in [self.online_interval_secs]
+        for interval in [self.online_interval_secs, self.environment_interval_secs]
             .into_iter()
             .chain(self.retry_intervals_secs)
         {
@@ -178,21 +367,8 @@ impl Config {
         {
             bail!("三个阶段的重试间隔必须依次不减");
         }
-        let probe = &self.probe;
-        if !(1..=3600).contains(&probe.interval_secs)
-            || !(1..=30).contains(&probe.timeout_secs)
-            || !(1..=10).contains(&probe.failure_threshold)
-        {
-            bail!("探测间隔须为 1–3600 秒，超时为 1–30 秒，失败门槛为 1–10 轮");
-        }
-        if probe.backups.len() > 3 || probe.tcp_port == 0 {
-            bail!("最多配置 3 个备用目标，TCP 端口必须大于 0");
-        }
-        for ip in std::iter::once(&probe.primary).chain(&probe.backups) {
-            if ip.is_unspecified() || ip.is_multicast() || *ip == Ipv4Addr::BROADCAST {
-                bail!("探测目标必须是单播 IPv4 地址");
-            }
-        }
+        self.probe.validate()?;
+        self.campus_probe.validate()?;
         Ok(())
     }
 }

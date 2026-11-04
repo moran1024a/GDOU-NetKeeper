@@ -82,7 +82,10 @@ impl<'a> SrunClient<'a> {
     pub fn check_account(&self, state: &Value) -> Result<()> {
         if let Some(username) = state["user_name"].as_str().filter(|s| !s.is_empty()) {
             if username != self.config.username {
-                bail!("在线账号与当前会话账号不一致，未切换或注销账号");
+                return Err(CredentialRejected(
+                    "在线账号与当前会话账号不一致，未切换或注销账号".into(),
+                )
+                .into());
             }
         }
         Ok(())

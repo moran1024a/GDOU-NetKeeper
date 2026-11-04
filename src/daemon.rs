@@ -2,7 +2,7 @@ use crate::{
     client::CredentialRejected,
     config::Config,
     probe,
-    session::Authentication,
+    session::{Authentication, EnvironmentUnavailable},
     state::{Phase, State},
 };
 use anyhow::{Context, Result};
@@ -25,7 +25,15 @@ use tokio::{
 pub const START_TIMEOUT: Duration = Duration::from_secs(45);
 pub const START_FAILED: u8 = 78;
 
-// Only systemd launches the daemon. Readiness is sent after the first online check.
+#[derive(Debug)]
+pub struct StartupFailed(String);
+impl std::fmt::Display for StartupFailed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+impl std::error::Error for StartupFailed {}
+
 fn notify(message: &str) -> Result<()> {
     let address = std::env::var_os("NOTIFY_SOCKET").context("请通过 netkeeper start 启动服务")?;
     let socket = UnixDatagram::unbound()?;
@@ -39,35 +47,141 @@ fn notify(message: &str) -> Result<()> {
     Ok(())
 }
 
+fn publish(state: &State, directory: &Path) -> Result<()> {
+    state.save(directory)?;
+    // RuntimeDirectoryPreserve + DynamicUser makes the snapshot private. Expose a
+    // password-free summary through systemd so unprivileged status still works.
+    notify(&format!("STATUS={}", serde_json::to_string(state)?))
+}
+
 fn report(state: &mut State, directory: &Path, phase: Phase, detail: &str) -> Result<()> {
     state.update(directory, phase, detail)?;
-    notify(&format!("STATUS={}", detail.replace(['\n', '\r'], " ")))?;
+    publish(state, directory)?;
     eprintln!("{detail}");
     Ok(())
 }
 
+fn record_probe(state: &mut State, result: probe::ProbeResult, campus: bool) {
+    let (count, slot) = if campus {
+        (&mut state.campus_failures, &mut state.campus_probe)
+    } else {
+        (&mut state.probe_failures, &mut state.probe)
+    };
+    *count = if result.reachable {
+        0
+    } else {
+        count.saturating_add(1)
+    };
+    *slot = Some(result);
+}
+
+async fn evaluate(
+    config: &Config,
+    authentication: &mut Authentication<'_>,
+    state: &mut State,
+) -> Result<String> {
+    let ip = probe::link(config.interface.as_deref()).map_err(|error| {
+        state.local_ip = None;
+        state.probe = None;
+        state.campus_probe = None;
+        EnvironmentUnavailable(format!("{error:#}"))
+    })?;
+    state.local_ip = Some(ip);
+    let (public, campus) = tokio::join!(
+        probe::check(&config.probe, config.interface.as_deref()),
+        probe::check(&config.campus_probe, config.interface.as_deref())
+    );
+    record_probe(state, public.clone(), false);
+    record_probe(state, campus.clone(), true);
+    let outcome = authentication.cycle(ip, &public, &campus).await?;
+    if outcome.logged_in {
+        let (public, campus) = tokio::join!(
+            probe::check(&config.probe, config.interface.as_deref()),
+            probe::check(&config.campus_probe, config.interface.as_deref())
+        );
+        record_probe(state, public, false);
+        record_probe(state, campus, true);
+    }
+    Ok(outcome.detail)
+}
+
+fn retry_delay(config: &Config, attempts: u32) -> u64 {
+    config.retry_intervals_secs[match attempts {
+        0..=3 => 0,
+        4..=6 => 1,
+        _ => 2,
+    }]
+}
+
+fn finish_cycle(
+    config: &Config,
+    state: &mut State,
+    directory: &Path,
+    result: Result<String>,
+) -> Result<()> {
+    let (phase, detail) = match result {
+        Ok(detail) => {
+            state.started = true;
+            state.recovery_attempts = 0;
+            if state.probe.as_ref().is_some_and(|p| p.reachable) {
+                state.next_retry_at = None;
+                (Phase::Online, detail)
+            } else {
+                state.next_retry_at = Some(crate::state::now() + config.environment_interval_secs);
+                (
+                    Phase::Degraded,
+                    format!("校园网已在线，公网出口异常；不重复登录，等待复查；{detail}"),
+                )
+            }
+        }
+        Err(error) if error.downcast_ref::<CredentialRejected>().is_some() => {
+            state.next_retry_at = None;
+            (
+                Phase::Paused,
+                format!("认证已暂停：{error:#}；请修改配置并重启服务"),
+            )
+        }
+        Err(error) if error.downcast_ref::<EnvironmentUnavailable>().is_some() => {
+            state.next_retry_at = Some(crate::state::now() + config.environment_interval_secs);
+            (
+                Phase::Waiting,
+                format!(
+                    "等待网络环境（{} 秒）：{error:#}",
+                    config.environment_interval_secs
+                ),
+            )
+        }
+        Err(error) => {
+            state.recovery_attempts = state.recovery_attempts.saturating_add(1);
+            let delay = retry_delay(config, state.recovery_attempts);
+            state.next_retry_at = Some(crate::state::now() + delay);
+            (
+                Phase::Retrying,
+                format!("等待认证恢复（{delay} 秒）：{error:#}"),
+            )
+        }
+    };
+    report(state, directory, phase, &detail)
+}
+
 pub async fn run(config_path: &Path, directory: &Path) -> Result<()> {
-    notify("STATUS=正在读取配置")?;
-    let mut state = State::new(None);
+    let previous = State::read(directory).filter(|s| s.started);
+    let resumed = previous.is_some();
+    let mut state = previous.unwrap_or_else(|| State::new(None));
+    state.pid = std::process::id();
     let config = match Config::load(config_path) {
         Ok(config) => config,
         Err(error) => {
-            report(
-                &mut state,
-                directory,
-                Phase::Failed,
-                &format!("配置无效：{error:#}"),
-            )?;
-            return Err(error);
+            let detail = format!("配置无效：{error:#}");
+            report(&mut state, directory, Phase::Failed, &detail)?;
+            return Err(if resumed {
+                error
+            } else {
+                StartupFailed(detail).into()
+            });
         }
     };
     state.interface = config.interface.clone();
-    report(
-        &mut state,
-        directory,
-        Phase::Starting,
-        "正在检查网络并进行首次认证",
-    )?;
     let mut terminate = signal(SignalKind::terminate())?;
     let mut interrupt = signal(SignalKind::interrupt())?;
     let mut refresh = signal(SignalKind::user_defined1())?;
@@ -76,163 +190,129 @@ pub async fn run(config_path: &Path, directory: &Path) -> Result<()> {
     };
     tokio::pin!(shutdown);
     let mut authentication = Authentication::new(&config);
-
-    let first = tokio::select! {
-        biased;
-        _ = &mut shutdown => {
-            report(&mut state, directory, Phase::Stopped, "启动已取消")?;
-            return Ok(());
-        },
-        result = tokio::time::timeout(START_TIMEOUT, authentication.cycle()) => {
-            match result {
-                Ok(result) => result,
-                Err(_) => Err(anyhow::anyhow!("首次认证超过 45 秒，启动已终止")),
-            }
+    if resumed {
+        let phase = if state.phase == Phase::Paused {
+            Phase::Paused
+        } else {
+            Phase::Waiting
+        };
+        let detail = format!(
+            "进程已恢复；{}",
+            state.detail.trim_start_matches("进程已恢复；")
+        );
+        report(&mut state, directory, phase, &detail)?;
+        // Recovery may wait for a disconnected interface; readiness here means
+        // the already-armed worker is restored, not that the old online flag is valid.
+        notify("READY=1")?;
+    } else {
+        report(
+            &mut state,
+            directory,
+            Phase::Starting,
+            "正在检查校园网环境并确认首次在线",
+        )?;
+        let first = tokio::select! {
+            biased;
+            _ = &mut shutdown => return Ok(()),
+            result = tokio::time::timeout(START_TIMEOUT, evaluate(&config, &mut authentication, &mut state)) =>
+                result.unwrap_or_else(|_| Err(anyhow::anyhow!("首次认证超过 45 秒"))),
+        };
+        (state.portal_url, state.ac_id) = authentication.parameters();
+        if let Err(error) = first {
+            let detail = format!("启动失败：{error:#}");
+            report(&mut state, directory, Phase::Failed, &detail)?;
+            return Err(StartupFailed(detail).into());
         }
-    };
-    (state.portal_url, state.ac_id) = authentication.parameters();
-    let detail = match first {
-        Err(error) => {
-            report(
-                &mut state,
-                directory,
-                Phase::Failed,
-                &format!("启动失败：{error:#}"),
-            )?;
-            return Err(error);
-        }
-        Ok(detail) => detail,
-    };
-    report(&mut state, directory, Phase::Online, &detail)?;
-    notify("READY=1")?;
+        finish_cycle(&config, &mut state, directory, first)?;
+        notify("READY=1")?;
+    }
 
     let interval = Duration::from_secs(config.probe.interval_secs);
     let mut probes = tokio::time::interval_at(Instant::now() + interval, interval);
     probes.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    let mut campus_due = Instant::now() + Duration::from_secs(config.campus_probe.interval_secs);
     let mut portal_due = Instant::now() + Duration::from_secs(config.online_interval_secs);
-    let mut retry_due = None;
+    let mut retry_due = state
+        .next_retry_at
+        .map(|at| Instant::now() + Duration::from_secs(at.saturating_sub(crate::state::now())));
+    if resumed && state.phase != Phase::Paused && retry_due.is_none() {
+        retry_due = Some(Instant::now());
+    }
     loop {
-        let recovering = retry_due.is_some();
+        let waiting = retry_due.is_some();
         let paused = state.phase == Phase::Paused;
         let deadline = retry_due.unwrap_or(portal_due);
-        // One event loop serializes all work. During recovery only the retry
-        // deadline can trigger network I/O; signals cannot bypass backoff.
-        let check_probe = tokio::select! {
+        let event = tokio::select! {
             biased;
             _ = &mut shutdown => break,
             _ = refresh.recv() => {
-                if recovering || paused {
+                if waiting || paused {
                     let phase = state.phase;
                     let detail = state.detail.clone();
                     report(&mut state, directory, phase, &detail)?;
                     continue;
                 }
-                false
+                0
             },
-            _ = tokio::time::sleep_until(deadline), if !paused => false,
-            _ = probes.tick(), if !recovering && !paused => true,
+            _ = tokio::time::sleep_until(deadline), if !paused => 0,
+            _ = tokio::time::sleep_until(campus_due), if !waiting && !paused => 2,
+            _ = probes.tick(), if !waiting && !paused => 1,
         };
-        if check_probe {
-            let result = tokio::select! {
-                biased;
-                _ = &mut shutdown => break,
-                result = probe::check(&config) => result,
-            };
-            record_probe(&mut state, result);
-            state.save(directory)?;
-            if state.probe_failures < config.probe.failure_threshold {
-                continue;
-            }
-        }
-
-        let result = tokio::select! {
-            biased;
-            _ = &mut shutdown => break,
-            result = authentication.cycle() => result,
-        };
-        (state.portal_url, state.ac_id) = authentication.parameters();
-        // If probes triggered recovery, Portal's online flag alone must not
-        // reset the outage: verify the public path after the authentication.
-        let result = if result.is_ok()
-            && (recovering || state.probe_failures >= config.probe.failure_threshold)
-        {
-            let probe = tokio::select! {
-                biased;
-                _ = &mut shutdown => break,
-                result = probe::check(&config) => result,
-            };
-            let reachable = probe.reachable;
-            record_probe(&mut state, probe);
-            if reachable {
-                result
-            } else {
-                Err(anyhow::anyhow!(
-                    "Portal 报告在线，但公网探测仍失败；不会重复登录，等待复查"
-                ))
-            }
-        } else {
-            result
-        };
-
-        probes.reset();
-        match result {
-            Ok(detail) => {
-                state.recovery_attempts = 0;
-                state.next_retry_at = None;
-                retry_due = None;
-                portal_due = Instant::now() + Duration::from_secs(config.online_interval_secs);
-                report(&mut state, directory, Phase::Online, &detail)?;
-            }
-            Err(error) => {
-                state.recovery_attempts = state.recovery_attempts.saturating_add(1);
-                if error.downcast_ref::<CredentialRejected>().is_some() {
-                    retry_due = None;
-                    state.next_retry_at = None;
-                    report(
-                        &mut state,
-                        directory,
-                        Phase::Paused,
-                        &format!("认证已暂停：{error:#}；请修改配置并重启服务"),
-                    )?;
+        if event != 0 {
+            let unchanged = probe::link(config.interface.as_deref())
+                .ok()
+                .is_some_and(|ip| Some(ip) == state.local_ip);
+            if unchanged {
+                let campus = event == 2;
+                let group = if campus {
+                    &config.campus_probe
                 } else {
-                    let delay = retry_delay(&config, state.recovery_attempts);
-                    retry_due = Some(Instant::now() + Duration::from_secs(delay));
-                    state.next_retry_at = Some(crate::state::now() + delay);
-                    report(
-                        &mut state,
-                        directory,
-                        Phase::Retrying,
-                        &format!("等待重试（{delay} 秒）：{error:#}"),
-                    )?;
+                    &config.probe
+                };
+                let result = tokio::select! {
+                    biased;
+                    _ = &mut shutdown => break,
+                    result = probe::check(group, config.interface.as_deref()) => result,
+                };
+                record_probe(&mut state, result, campus);
+                publish(&state, directory)?;
+                if campus {
+                    campus_due = Instant::now() + Duration::from_secs(group.interval_secs);
+                }
+                let failures = if campus {
+                    state.campus_failures
+                } else {
+                    state.probe_failures
+                };
+                if failures < group.failure_threshold {
+                    continue;
                 }
             }
         }
+        // Reserve a deadline before network I/O, so an abrupt death cannot
+        // bypass recovery backoff. Replace it with the actual deadline on completion.
+        state.next_retry_at = Some(
+            crate::state::now()
+                + START_TIMEOUT.as_secs()
+                + retry_delay(&config, state.recovery_attempts.saturating_add(1)),
+        );
+        publish(&state, directory)?;
+        let result = tokio::select! {
+            biased;
+            _ = &mut shutdown => break,
+            result = tokio::time::timeout(START_TIMEOUT, evaluate(&config, &mut authentication, &mut state)) =>
+                result.unwrap_or_else(|_| Err(anyhow::anyhow!("网络检查与认证超过 45 秒，等待重试"))),
+        };
+        (state.portal_url, state.ac_id) = authentication.parameters();
+        finish_cycle(&config, &mut state, directory, result)?;
+        retry_due = state
+            .next_retry_at
+            .map(|at| Instant::now() + Duration::from_secs(at.saturating_sub(crate::state::now())));
+        probes.reset();
+        campus_due = Instant::now() + Duration::from_secs(config.campus_probe.interval_secs);
+        portal_due = Instant::now() + Duration::from_secs(config.online_interval_secs);
     }
-    state.next_retry_at = None;
-    report(
-        &mut state,
-        directory,
-        Phase::Stopped,
-        "服务已停止，不再巡检或重试",
-    )?;
+    // systemctl stop removes /run; direct SIGTERM preserves the prior recovery state.
     notify("STOPPING=1")?;
     Ok(())
-}
-
-fn record_probe(state: &mut State, probe: probe::ProbeResult) {
-    state.probe_failures = if probe.reachable {
-        0
-    } else {
-        state.probe_failures.saturating_add(1)
-    };
-    state.probe = Some(probe);
-}
-
-fn retry_delay(config: &Config, failed_attempts: u32) -> u64 {
-    let stage = match failed_attempts {
-        0..=3 => 0,
-        4..=6 => 1,
-        _ => 2,
-    };
-    config.retry_intervals_secs[stage]
 }

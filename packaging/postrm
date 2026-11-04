@@ -8,8 +8,14 @@ case "$1" in
     purge)
         deb-systemd-helper purge netkeeper.service >/dev/null || true
         deb-systemd-helper unmask netkeeper.service >/dev/null || true
-        rm -f "${DPKG_ROOT:-}/run/netkeeper/status.json"
-        rmdir "${DPKG_ROOT:-}/run/netkeeper" 2>/dev/null || true
+        if [ -L "${DPKG_ROOT:-}/run/netkeeper" ]; then
+            rm -f "${DPKG_ROOT:-}/run/private/netkeeper/status.json"
+            rm -f "${DPKG_ROOT:-}/run/netkeeper"
+            rmdir "${DPKG_ROOT:-}/run/private/netkeeper" 2>/dev/null || true
+        else
+            rm -f "${DPKG_ROOT:-}/run/netkeeper/status.json"
+            rmdir "${DPKG_ROOT:-}/run/netkeeper" 2>/dev/null || true
+        fi
         if [ -L "${DPKG_ROOT:-}/var/lib/netkeeper" ]; then
             rm -f "${DPKG_ROOT:-}/var/lib/private/netkeeper/session.json"
             rm -f "${DPKG_ROOT:-}/var/lib/netkeeper"

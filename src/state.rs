@@ -15,6 +15,8 @@ pub enum Phase {
     Starting,
     Online,
     Retrying,
+    Waiting,
+    Degraded,
     Paused,
     Failed,
     Stopped,
@@ -23,6 +25,10 @@ pub enum Phase {
 #[derive(Deserialize, Serialize)]
 pub struct State {
     pub pid: u32,
+    #[serde(default)]
+    pub started: bool,
+    #[serde(default)]
+    pub local_ip: Option<std::net::Ipv4Addr>,
     pub phase: Phase,
     pub interface: Option<String>,
     #[serde(default)]
@@ -38,6 +44,10 @@ pub struct State {
     #[serde(default)]
     pub probe_failures: u32,
     #[serde(default)]
+    pub campus_probe: Option<crate::probe::ProbeResult>,
+    #[serde(default)]
+    pub campus_failures: u32,
+    #[serde(default)]
     pub recovery_attempts: u32,
     #[serde(default)]
     pub next_retry_at: Option<u64>,
@@ -47,6 +57,8 @@ impl State {
     pub fn new(interface: Option<String>) -> Self {
         Self {
             pid: std::process::id(),
+            started: false,
+            local_ip: None,
             phase: Phase::Starting,
             interface,
             portal_url: None,
@@ -56,6 +68,8 @@ impl State {
             detail: "正在启动".into(),
             probe: None,
             probe_failures: 0,
+            campus_probe: None,
+            campus_failures: 0,
             recovery_attempts: 0,
             next_retry_at: None,
         }

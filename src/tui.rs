@@ -1,4 +1,4 @@
-use crate::config::{AuthMode, Config, ProbeMode};
+use crate::config::{AuthMode, Config, ProbeConfig, ProbeMode, ProbeTarget};
 use crate::discovery;
 use anyhow::{ensure, Context, Result};
 use crossterm::{
@@ -355,6 +355,8 @@ pub async fn settings(path: &Path) -> Result<bool> {
                     "手动指定"
                 }
             ),
+            "内网探测设置".into(),
+            format!("环境等待间隔（秒）：{}", config.environment_interval_secs),
             "保存配置".into(),
             "取消".into(),
         ];
@@ -389,7 +391,7 @@ pub async fn settings(path: &Path) -> Result<bool> {
                 "Portal 巡检间隔（秒）",
                 &mut config.online_interval_secs,
             )?,
-            6 => probe_settings(&mut ui, &mut config)?,
+            6 => probe_settings(&mut ui, &mut config.probe, false)?,
             7 => retry_settings(&mut ui, &mut config)?,
             8 => discover_settings(&mut ui, &mut config).await?,
             9 => {
@@ -416,7 +418,13 @@ pub async fn settings(path: &Path) -> Result<bool> {
                     };
                 }
             }
-            11 => match config.save(path) {
+            11 => probe_settings(&mut ui, &mut config.campus_probe, true)?,
+            12 => number(
+                &mut ui,
+                "环境等待间隔（秒）",
+                &mut config.environment_interval_secs,
+            )?,
+            13 => match config.save(path) {
                 Ok(()) => return Ok(true),
                 Err(error) => ui.message("配置未保存", &format!("{error:#}"))?,
             },
@@ -479,21 +487,10 @@ fn number<T: std::str::FromStr + std::fmt::Display>(
     Ok(())
 }
 
-fn probe_settings(ui: &mut Ui, config: &mut Config) -> Result<()> {
+fn probe_settings(ui: &mut Ui, probe: &mut ProbeConfig, campus: bool) -> Result<()> {
     let mut selected = 0;
     loop {
-        let probe = &mut config.probe;
-        let mut choices = vec![
-            format!(
-                "方式：{}",
-                if probe.mode == ProbeMode::Icmp {
-                    "ICMP"
-                } else {
-                    "TCP"
-                }
-            ),
-            format!("主目标 IPv4：{}", probe.primary),
-        ];
+        let mut choices = vec![format!("主目标：{}", probe.primary.label())];
         for i in 0..3 {
             choices.push(format!(
                 "备用目标 {}：{}",
@@ -501,76 +498,154 @@ fn probe_settings(ui: &mut Ui, config: &mut Config) -> Result<()> {
                 probe
                     .backups
                     .get(i)
-                    .map(ToString::to_string)
+                    .map(ProbeTarget::label)
                     .unwrap_or_else(|| "未配置".into())
             ));
         }
         choices.extend([
-            format!("TCP 端口：{}", probe.tcp_port),
             format!("轮询间隔（秒）：{}", probe.interval_secs),
-            format!("单目标超时（秒）：{}", probe.timeout_secs),
+            format!("普通探测超时（秒）：{}", probe.timeout_secs),
+            format!("HTTPS 超时（秒）：{}", probe.https_timeout_secs),
             format!("连续失败门槛（轮）：{}", probe.failure_threshold),
+            "恢复本组默认值".into(),
             "返回设置（主菜单保存后生效）".into(),
         ]);
-        let Some(index) = ui.select("公网探测设置", &choices, selected)? else {
+        let Some(index) = ui.select(
+            if campus {
+                "内网探测（所有目标均按可信校园网目标处理）"
+            } else {
+                "公网探测设置"
+            },
+            &choices,
+            selected,
+        )?
+        else {
             return Ok(());
         };
         selected = index;
         match index {
-            0 => {
-                if let Some(mode) = ui.select(
-                    "探测方式",
-                    &["ICMP".into(), "TCP".into()],
-                    usize::from(probe.mode == ProbeMode::Tcp),
-                )? {
-                    probe.mode = if mode == 0 {
-                        ProbeMode::Icmp
-                    } else {
-                        ProbeMode::Tcp
-                    };
-                }
-            }
-            1..=4 => {
-                let current = if index == 1 {
-                    probe.primary.to_string()
+            0..=3 => {
+                let existing = if index == 0 {
+                    Some(&probe.primary)
                 } else {
-                    probe
-                        .backups
-                        .get(index - 2)
-                        .map(ToString::to_string)
-                        .unwrap_or_default()
+                    probe.backups.get(index - 1)
                 };
-                let label = if index == 1 {
-                    "主目标 IPv4"
-                } else {
-                    "备用目标 IPv4（清空可移除）"
-                };
-                if let Some(value) = ui.input(label, &current)? {
-                    if value.is_empty() && index > 1 {
-                        if index - 2 < probe.backups.len() {
-                            probe.backups.remove(index - 2);
+                if let Some(value) = target_settings(ui, existing, index > 0)? {
+                    if index == 0 {
+                        probe.primary = value.expect("primary cannot be removed");
+                    } else if let Some(value) = value {
+                        if let Some(slot) = probe.backups.get_mut(index - 1) {
+                            *slot = value;
+                        } else {
+                            probe.backups.push(value);
                         }
-                    } else {
-                        match value.parse() {
-                            Ok(ip) => {
-                                if index == 1 {
-                                    probe.primary = ip;
-                                } else if let Some(target) = probe.backups.get_mut(index - 2) {
-                                    *target = ip;
-                                } else {
-                                    probe.backups.push(ip);
-                                }
-                            }
-                            Err(_) => ui.message("输入无效", "请输入 IPv4 地址，例如 223.5.5.5")?,
-                        }
+                    } else if index - 1 < probe.backups.len() {
+                        probe.backups.remove(index - 1);
                     }
                 }
             }
-            5 => number(ui, "TCP 端口", &mut probe.tcp_port)?,
-            6 => number(ui, "轮询间隔（秒）", &mut probe.interval_secs)?,
-            7 => number(ui, "单目标超时（秒）", &mut probe.timeout_secs)?,
-            8 => number(ui, "连续失败门槛（轮）", &mut probe.failure_threshold)?,
+            4 => number(ui, "轮询间隔（秒）", &mut probe.interval_secs)?,
+            5 => number(ui, "普通探测超时（秒）", &mut probe.timeout_secs)?,
+            6 => number(ui, "HTTPS 超时（秒）", &mut probe.https_timeout_secs)?,
+            7 => number(ui, "连续失败门槛（轮）", &mut probe.failure_threshold)?,
+            8 => {
+                *probe = if campus {
+                    ProbeConfig::campus()
+                } else {
+                    ProbeConfig::default()
+                }
+            }
             _ => return Ok(()),
+        }
+    }
+}
+
+// None cancels, Some(None) removes a backup, Some(Some(..)) commits the edited target.
+fn target_settings(
+    ui: &mut Ui,
+    current: Option<&ProbeTarget>,
+    optional: bool,
+) -> Result<Option<Option<ProbeTarget>>> {
+    let mut target = current.cloned().unwrap_or(ProbeTarget {
+        mode: ProbeMode::Tcp,
+        address: String::new(),
+        port: Some(443),
+    });
+    let mut selected = 0;
+    loop {
+        let mut choices = vec![
+            format!(
+                "类型：{}",
+                match target.mode {
+                    ProbeMode::Icmp => "普通探测 / ICMP",
+                    ProbeMode::Tcp => "普通探测 / TCP",
+                    ProbeMode::Https => "HTTPS / 验证 TLS 证书",
+                }
+            ),
+            format!("地址：{}", target.address),
+            format!(
+                "端口：{}",
+                if target.mode == ProbeMode::Icmp {
+                    "不适用".into()
+                } else {
+                    target.port().to_string()
+                }
+            ),
+            "保存目标".into(),
+        ];
+        if optional {
+            choices.push("移除该备用目标".into());
+        }
+        choices.push("取消".into());
+        let Some(index) = ui.select("编辑探测目标", &choices, selected)? else {
+            return Ok(None);
+        };
+        selected = index;
+        match index {
+            0 => {
+                let initial = match target.mode {
+                    ProbeMode::Icmp => 0,
+                    ProbeMode::Tcp => 1,
+                    ProbeMode::Https => 2,
+                };
+                if let Some(choice) = ui.select(
+                    "选择探测方式",
+                    &[
+                        "普通探测 / ICMP".into(),
+                        "普通探测 / TCP".into(),
+                        "HTTPS / TLS 握手及证书校验".into(),
+                    ],
+                    initial,
+                )? {
+                    target.mode = [ProbeMode::Icmp, ProbeMode::Tcp, ProbeMode::Https][choice];
+                    if choice != initial {
+                        target.port = match target.mode {
+                            ProbeMode::Icmp => None,
+                            ProbeMode::Tcp => Some(53),
+                            ProbeMode::Https => Some(443),
+                        };
+                    }
+                }
+            }
+            1 => {
+                if let Some(value) =
+                    ui.input("目标地址（IPv4 或域名，不含协议和路径）", &target.address)?
+                {
+                    target.address = value;
+                }
+            }
+            2 if target.mode != ProbeMode::Icmp => {
+                let mut port = target.port();
+                number(ui, "端口", &mut port)?;
+                target.port = Some(port);
+            }
+            2 => ui.message("ICMP", "ICMP 不使用端口")?,
+            3 => match target.validate() {
+                Ok(()) => return Ok(Some(Some(target))),
+                Err(error) => ui.message("目标无效", &format!("{error:#}"))?,
+            },
+            4 if optional => return Ok(Some(None)),
+            _ => return Ok(None),
         }
     }
 }

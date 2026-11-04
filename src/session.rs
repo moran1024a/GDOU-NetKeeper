@@ -1,5 +1,5 @@
 use crate::{
-    client::{outbound_ip, AccessRejected, SrunClient},
+    client::{AccessRejected, SrunClient},
     config::{AuthMode, Config},
     discovery::{self, Detection, Parameters},
     probe,
@@ -9,7 +9,7 @@ use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::{
     io::Write,
-    net::{Ipv4Addr, SocketAddr},
+    net::Ipv4Addr,
     os::unix::fs::{DirBuilderExt, PermissionsExt},
     path::Path,
     time::Duration,
@@ -77,6 +77,20 @@ impl Session {
             ..Config::default()
         }
     }
+}
+
+#[derive(Debug)]
+pub struct EnvironmentUnavailable(pub String);
+impl std::fmt::Display for EnvironmentUnavailable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+impl std::error::Error for EnvironmentUnavailable {}
+
+pub struct AuthOutcome {
+    pub detail: String,
+    pub logged_in: bool,
 }
 
 pub struct Authentication<'a> {
@@ -176,17 +190,14 @@ impl<'a> Authentication<'a> {
         Ok(())
     }
 
-    fn public_online(&mut self, config: &Config) -> Result<String> {
-        let ip = outbound_ip(
-            SocketAddr::from((config.probe.primary, 80)),
-            config.interface.as_deref(),
-        )?;
-        self.remember(config, ip, false)?;
-        Ok("公网可达；Portal 状态未确认，接入参数以实际会话记录为准，不重复登录".into())
-    }
-
-    pub async fn cycle(&mut self) -> Result<String> {
-        let result = self.check().await;
+    pub async fn cycle(
+        &mut self,
+        ip: Ipv4Addr,
+        public: &probe::ProbeResult,
+        campus: &probe::ProbeResult,
+    ) -> Result<AuthOutcome> {
+        self.observe_ip(ip);
+        let result = self.check(ip, public, campus).await;
         let (portal, id) = self.parameters();
         let context = format!(
             "网卡={}，Portal={}，ac_id={}",
@@ -195,18 +206,32 @@ impl<'a> Authentication<'a> {
             id.map(|v| v.to_string()).unwrap_or_else(|| "待确认".into())
         );
         result
-            .map(|detail| format!("{detail}；{context}"))
+            .map(|mut outcome| {
+                outcome.detail = format!("{}；{context}", outcome.detail);
+                outcome
+            })
             .with_context(|| format!("认证流程失败（{context}）"))
     }
 
-    async fn check(&mut self) -> Result<String> {
+    async fn check(
+        &mut self,
+        ip: Ipv4Addr,
+        public: &probe::ProbeResult,
+        campus: &probe::ProbeResult,
+    ) -> Result<AuthOutcome> {
         let mut effective = self.effective();
         let mut offline = false;
         let mut status_error = "尚无可用 Portal".to_owned();
         if !effective.portal_url.is_empty() {
             match SrunClient::new(&effective).await {
                 Ok(client) => {
-                    self.observe_ip(client.ip);
+                    if client.ip != ip {
+                        self.observe_ip(client.ip);
+                        return Err(EnvironmentUnavailable(
+                            "出口 IPv4 已变化，等待重新检查".into(),
+                        )
+                        .into());
+                    }
                     match client.status().await {
                         Ok(state) => match protocol::status(&state) {
                             Status::Online => {
@@ -218,7 +243,10 @@ impl<'a> Authentication<'a> {
                                         self.parameters.as_ref().map(|p| p.ac_id).unwrap_or(0);
                                 }
                                 self.remember(&confirmed, client.ip, true)?;
-                                return Ok("已确认在线".into());
+                                return Ok(AuthOutcome {
+                                    detail: "Portal 已确认在线".into(),
+                                    logged_in: false,
+                                });
                             }
                             Status::Offline => offline = true,
                             Status::Unknown => {
@@ -235,9 +263,20 @@ impl<'a> Authentication<'a> {
             }
         }
         effective = self.effective();
-        if !offline && probe::check(&effective).await.reachable {
-            let message = self.public_online(&effective)?;
-            return Ok(format!("{message}；{status_error}"));
+        if !offline && campus.reachable {
+            self.remember(&effective, ip, false)?;
+            return Ok(AuthOutcome {
+                detail: format!(
+                    "可信内网目标可达，按配置确认校园网在线；Portal 未确认：{status_error}"
+                ),
+                logged_in: false,
+            });
+        }
+        if !offline && public.reachable {
+            return Err(EnvironmentUnavailable(format!(
+                "公网可达，校园环境未确认；{status_error}"
+            ))
+            .into());
         }
 
         let auto = self.config.auth_mode == AuthMode::Auto;
@@ -256,11 +295,23 @@ impl<'a> Authentication<'a> {
                 self.parameters = None;
             }
             self.last_discovery = Some(Instant::now());
-            let detected = discovery::detect(self.config.interface.as_deref())
-                .await
-                .with_context(|| format!("参数识别失败；此前状态：{status_error}"))?;
+            let detected = match discovery::detect(self.config.interface.as_deref()).await {
+                Ok(value) => value,
+                Err(error) if !offline => {
+                    return Err(EnvironmentUnavailable(format!(
+                        "校园环境未知；{status_error}；{error:#}"
+                    ))
+                    .into())
+                }
+                Err(error) => return Err(error).context("Portal 已报告离线，但参数识别失败"),
+            };
             match detected {
-                Detection::Online => return self.public_online(&effective),
+                Detection::Online => {
+                    return Err(EnvironmentUnavailable(
+                        "HTTP 公网可达，但校园认证未确认；未发送登录".into(),
+                    )
+                    .into())
+                }
                 Detection::Captive(parameters) => {
                     if auto {
                         self.parameters = Some(parameters);
@@ -275,11 +326,11 @@ impl<'a> Authentication<'a> {
             .await
             .context("准备认证出口失败")?;
         // Keep a newly discovered candidate attached to the address used to authenticate.
-        if !need_discovery && self.local_ip.is_some_and(|old| old != client.ip) {
+        if client.ip != ip {
             self.observe_ip(client.ip);
-            if auto {
-                bail!("参数识别期间出口 IP 已改变，等待重新识别");
-            }
+            return Err(
+                EnvironmentUnavailable("参数识别期间出口 IP 已改变，等待重新识别".into()).into(),
+            );
         }
         if self
             .cached
@@ -297,6 +348,9 @@ impl<'a> Authentication<'a> {
         }
         client.confirm_online().await.context("确认在线失败")?;
         self.remember(&effective, client.ip, true)?;
-        Ok("已确认在线".into())
+        Ok(AuthOutcome {
+            detail: "登录后已确认在线".into(),
+            logged_in: true,
+        })
     }
 }

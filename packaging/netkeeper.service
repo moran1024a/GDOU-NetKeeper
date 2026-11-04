@@ -2,18 +2,23 @@
 Description=GDOU SRUN network authentication
 After=network.target
 ConditionPathExists=/etc/netkeeper/config.toml
+StartLimitIntervalSec=0
 
 [Service]
 Type=notify
 NotifyAccess=main
 ExecStart=/usr/bin/netkeeper run --config %d/config
-Restart=no
+Restart=always
+RestartPreventExitStatus=78
+RestartSec=5s
+RestartSteps=5
+RestartMaxDelaySec=30s
 TimeoutStartSec=50s
 TimeoutStopSec=5s
 RuntimeDirectory=netkeeper
 RuntimeDirectoryMode=0755
-# Preserve=no keeps this non-secret status directory outside /run/private.
-RuntimeDirectoryPreserve=no
+# Keep recovery intent across process restarts, but clear it on stop and reboot.
+RuntimeDirectoryPreserve=restart
 # systemd reads the root-only config and supplies it to a temporary service user.
 DynamicUser=yes
 StateDirectory=netkeeper
@@ -28,6 +33,3 @@ ProtectHome=yes
 PrivateTmp=yes
 StandardOutput=journal
 StandardError=journal
-
-[Install]
-WantedBy=multi-user.target

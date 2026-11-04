@@ -19,6 +19,7 @@ pub struct Service {
     pub exec_pid: u32,
     pub text: String,
     pub loaded: String,
+    pub state: Option<State>,
 }
 
 impl Service {
@@ -29,15 +30,11 @@ impl Service {
 
 impl Controller {
     pub async fn logout(&self) -> Result<&'static str> {
-        let before = self.inspect().await?;
         let snapshot = Session::read();
         self.stop().await.context("停止服务失败，未发送注销请求")?;
         let snapshot = snapshot.context("服务已停止，无法确认原会话，未发送注销请求")?;
         // Stop may finish an in-flight state update. The persistent record survives it.
         let snapshot = Session::read()?.or(snapshot);
-        if before.running() && snapshot.as_ref().is_none_or(|s| s.pid != before.pid) {
-            bail!("服务已停止，但缺少该进程的实际会话记录，未使用新配置注销；请确认当前认证参数");
-        }
         let mut config = match &snapshot {
             Some(record) => record.config(),
             None => Config::load(Path::new(CONFIG_PATH))
@@ -114,6 +111,10 @@ impl Controller {
                 }
             }
         }
+        if let Ok(state) = serde_json::from_str::<State>(&service.text) {
+            service.text = state.detail.clone();
+            service.state = Some(state);
+        }
         Ok(service)
     }
 
@@ -130,7 +131,8 @@ impl Controller {
             return Ok("服务尚未安装，请先安装 .deb 包".into());
         }
         let mut text = format!("服务：{label}\n进程：{}", service.pid);
-        if let Some(state) = State::read(Path::new(STATE_DIR)) {
+        let snapshot = State::read(Path::new(STATE_DIR));
+        if let Some(state) = snapshot.as_ref().or(service.state.as_ref()) {
             text.push_str(&format!(
                 "\n网卡：{}\n最近记录（{} 秒前）：{}",
                 state.interface.as_deref().unwrap_or("跟随系统路由"),
@@ -155,6 +157,14 @@ impl Controller {
                     state::now().saturating_sub(probe.checked_at),
                     probe.detail,
                     state.probe_failures
+                ));
+            }
+            if let Some(probe) = &state.campus_probe {
+                text.push_str(&format!(
+                    "\n内网探测（{} 秒前）：{}\n内网连续失败：{} 轮",
+                    state::now().saturating_sub(probe.checked_at),
+                    probe.detail,
+                    state.campus_failures
                 ));
             }
             text.push_str(&format!("\n恢复尝试：{} 次", state.recovery_attempts));
@@ -227,15 +237,16 @@ impl Controller {
                 });
                 if service.active == "active"
                     && fresh
-                    && state.as_ref().is_some_and(|s| s.phase == Phase::Online)
+                    && state
+                        .as_ref()
+                        .is_some_and(|s| matches!(s.phase, Phase::Online | Phase::Degraded))
                 {
                     return Ok(());
                 }
                 if refresh && fresh {
-                    if let Some(state) = state
-                        .as_ref()
-                        .filter(|s| matches!(s.phase, Phase::Retrying | Phase::Paused))
-                    {
+                    if let Some(state) = state.as_ref().filter(|s| {
+                        matches!(s.phase, Phase::Retrying | Phase::Paused | Phase::Waiting)
+                    }) {
                         bail!("在线确认失败：{}；原有服务仍在运行", state.detail);
                     }
                 }
