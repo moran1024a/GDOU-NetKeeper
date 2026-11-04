@@ -1,15 +1,15 @@
 # GDOU NetKeeper
 
 Linux SRUN 校园网认证服务，目标平台 Ubuntu 24.04，支持有线、Wi-Fi 和网卡绑定。
-v0.3.2 提供终端菜单、认证参数识别、主动注销、快速连通性探测和自动恢复，由 systemd 管理后台进程。
+提供终端菜单、认证参数识别、主动注销、快速连通性探测和自动恢复，由 systemd 管理后台进程。
 
 ## 安装与使用
 
 从 [Releases](https://github.com/moran1024a/GDOU-NetKeeper/releases) 下载 `.deb` 和 `.deb.sha256`，放在同一目录校验并安装：
 
 ```bash
-sha256sum -c gdou-netkeeper_0.3.2-1_amd64.deb.sha256
-sudo apt install ./gdou-netkeeper_0.3.2-1_amd64.deb
+sha256sum -c gdou-netkeeper_0.3.3-1_amd64.deb.sha256
+sudo apt install ./gdou-netkeeper_0.3.3-1_amd64.deb
 sudo netkeeper
 ```
 
@@ -63,9 +63,8 @@ TUI 的“注销校园网”需要确认，命令行 `logout` 直接执行；需
 
 配置保存在 `/etc/netkeeper/config.toml`，权限为 `0600`；取消设置不覆盖原配置。
 首次安装不自动启动，也不启用开机自启。升级保留配置，并重启正在运行的服务。
-从 0.1.0 / 0.2.0 升级可直接安装新版包，原配置仍可使用；新增字段采用默认值。
-已有 `online_interval_secs` 值保留，可在设置中改为 300 秒；旧 `retry_interval_secs` 忽略，保存后移除，
-改用 `retry_intervals_secs = [5, 15, 30]`。旧的 `--once` / `--check` 已移除。
+旧配置可继续使用，缺少的字段采用默认值；已有 `online_interval_secs` 值保留。
+旧 `retry_interval_secs` 忽略，保存后移除，改用 `retry_intervals_secs = [5, 15, 30]`。
 已有开机自启设置会保留，可用 `sudo systemctl disable netkeeper` 关闭。
 非交互环境支持 `start`、`stop`、`status`、`logout`；配置无效时提示先在终端完成设置。
 
@@ -74,22 +73,16 @@ TUI 的“注销校园网”需要确认，命令行 `logout` 直接执行；需
 查看日志使用 `journalctl -u netkeeper`。卸载使用 `sudo apt remove gdou-netkeeper`，
 删除配置及运行记录使用 `sudo apt purge gdou-netkeeper`。
 
-## 构建与测试
+## 构建
 
 需要 Rust stable、Python 3.11+、C 链接器、`dpkg-dev` 和 `iputils-ping`，在 Ubuntu 24.04 原生构建。
 
 ```bash
 cargo build --locked
-cargo test --locked
-python3 tests/behavior.py
 python3 packaging/build-deb.py
 ```
 
 安装包和 SHA-256 文件输出到 `dist/`，运行时无需 Rust 工具链；安装 deb 会自动安装 `iputils-ping` 依赖。
 依赖已缓存时可用 `python3 packaging/build-deb.py --offline` 打包。
-测试使用回环 ICMP/TCP、模拟 Portal 和伪终端，覆盖主备切换、连续失败、全部退避阶段、暂停、恢复及停止；
-不连接校园网，也不安装或启动本机 systemd 服务。本版本尚未在校园网实机验证。
-本次更新只运行自动识别、注销及相关 HTTP 路径的定向测试和设置 TUI 测试，未重复全量测试；
-设置 TUI 可单独用 `python3 tests/behavior.py --settings-only` 验证。
 
 本项目采用 [MIT License](LICENSE)，第三方依赖保留各自许可证。

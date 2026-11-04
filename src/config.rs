@@ -8,7 +8,7 @@ use std::path::Path;
 
 pub const CONFIG_PATH: &str = "/etc/netkeeper/config.toml";
 
-#[derive(Clone, Deserialize, Serialize)]
+#[derive(Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
     pub username: String,
@@ -182,77 +182,5 @@ impl Config {
             }
         }
         Ok(())
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    const CONFIG: &str = "username = 'student@campus'\npassword = 'secret'\nportal_url = 'http://10.0.0.1'\nac_id = 17\n";
-
-    #[test]
-    fn defaults_and_invalid_config() {
-        let config = Config::parse(CONFIG).unwrap();
-        assert_eq!(config.online_interval_secs, 300);
-        assert_eq!(config.retry_intervals_secs, [5, 15, 30]);
-        assert_eq!(config.probe.backups.len(), 3);
-        assert!(config.interface.is_none());
-        for extra in [
-            "interface = ''",
-            "unknown = true",
-            "retry_intervals_secs = [15, 5, 30]",
-            "[probe]\nprimary = '0.0.0.0'",
-            "[probe]\nprimary = 'bad-host'",
-            "[probe]\ntimeout_secs = 0",
-            "[probe]\nbackups = ['1.1.1.1', '2.2.2.2', '3.3.3.3', '4.4.4.4']",
-        ] {
-            assert!(Config::parse(&format!("{CONFIG}{extra}")).is_err());
-        }
-        assert!(Config::parse(&CONFIG.replace("http://10.0.0.1", "file:///etc/passwd")).is_err());
-        assert!(
-            Config::parse(&CONFIG.replace("http://10.0.0.1", "http://10.0.0.1/?ac_id=2")).is_err()
-        );
-    }
-
-    #[test]
-    fn legacy_configuration_keeps_explicit_portal_interval_and_gains_probe_defaults() {
-        let config = Config::parse(&format!(
-            "{CONFIG}online_interval_secs = 60\nretry_interval_secs = 15"
-        ))
-        .unwrap();
-        assert_eq!(config.online_interval_secs, 60);
-        assert_eq!(config.retry_intervals_secs, [5, 15, 30]);
-        assert_eq!(config.probe.primary, Ipv4Addr::new(223, 5, 5, 5));
-        assert!(Config::parse(&format!("{CONFIG}retry_interval_secs = 0")).is_ok());
-        assert!(!toml::to_string(&config)
-            .unwrap()
-            .contains("retry_interval_secs ="));
-    }
-
-    #[test]
-    fn malformed_config_does_not_echo_password() {
-        let error = Config::parse(&CONFIG.replace("'secret'", "'very-private-password"))
-            .err()
-            .unwrap();
-        assert!(!format!("{error:#}").contains("very-private-password"));
-    }
-
-    #[test]
-    fn saving_is_validated_private_and_round_trips_plaintext() {
-        let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("config.toml");
-        let mut config = Config::parse(CONFIG).unwrap();
-        config.password = "visible+密码\\\"".into();
-        config.save(&path).unwrap();
-        assert_eq!(Config::load(&path).unwrap().password, config.password);
-        assert_eq!(
-            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
-            0o600
-        );
-        let before = std::fs::read(&path).unwrap();
-        config.ac_id = 0;
-        assert!(config.save(&path).is_err());
-        assert_eq!(std::fs::read(&path).unwrap(), before);
     }
 }

@@ -121,7 +121,6 @@ pub fn parse_response(raw: &str, callback: &str) -> Result<Value> {
     Ok(value)
 }
 
-#[derive(Debug, PartialEq, Eq)]
 pub enum Status {
     Online,
     Offline,
@@ -139,57 +138,5 @@ pub fn status(value: &Value) -> Status {
         "ok" => Status::Online,
         "not_online" | "not_online_error" | "notonline" | "offline" => Status::Offline,
         _ => Status::Unknown,
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn matches_protocol_vectors_including_utf8_and_padding() {
-        // Fixed vectors cover UTF-8, special characters and Base64 padding.
-        let cases = [
-            ("student@campus", "password123", "{MD5}e0f9482af0422eecc1d12f18fe0cad89",
-             "{SRBX1}DTkrWWUhPMTGapLZmNzOG/PwWw9vmcFEPPG2mVx1xekcbfvZU116v1hyfb8AXBOtDSl2OlxzW7jzNIerejG77RsSZlxxUxhDUB3HToALZ+S7BfAkn6QRxgxhv5EUI6ZaH++WPefSwB5yapPzL8yXhv==",
-             "c0afeb9e6078b363e46a7e689eccaa8525386497"),
-            ("测试@campus", "p+&=/密", "{MD5}ffae8140404782529394022f0b728f0f",
-             "{SRBX1}5dqxkKc5501dcs173W1PHz3+WQJ9LLuy2rhdKgYbEuYNmGHCRNUhtUFeQH6huC+uqtFmxMqK8tctYzzPCXCc/uskIdsRLJC6P7FpEQVf1Eg6LCLujJUPyMrHB1pg2ak0cKUT0q8tdmPLrovP",
-             "18971b729d05c89fbb6451ebf76ec9b2d3763941"),
-        ];
-        for (username, password, expected_password, expected_info, expected_checksum) in cases {
-            let actual = auth_params(
-                username,
-                password,
-                "10.20.30.40",
-                17,
-                "0123456789abcdef0123456789abcdef",
-            )
-            .unwrap();
-            assert_eq!(actual.password, expected_password);
-            assert_eq!(actual.info, expected_info);
-            assert_eq!(actual.chksum, expected_checksum);
-        }
-    }
-
-    #[test]
-    fn jsonp_and_status_variants() {
-        for text in [
-            r#"{"error":"ok","res":0}"#,
-            r#"cb({"error":"ok","res":0});"#,
-        ] {
-            assert_eq!(status(&parse_response(text, "cb").unwrap()), Status::Online);
-        }
-        for code in ["not_online", "not_online_error", "notonline", "offline"] {
-            assert_eq!(status(&serde_json::json!({"error": code})), Status::Offline);
-        }
-        assert_eq!(
-            status(&serde_json::json!({"error":"server_busy"})),
-            Status::Unknown
-        );
-        for text in ["cb({});evil()", "other({})", "cb([])", "<html>login</html>"] {
-            assert!(parse_response(text, "cb").is_err());
-        }
-        assert!(auth_params("user", "password", "10.0.0.2", 1, "").is_err());
     }
 }

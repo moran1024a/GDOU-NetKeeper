@@ -1,6 +1,6 @@
 [package]
 name = "gdou-netkeeper"
-version = "0.3.2"
+version = "0.3.3"
 edition = "2021"
 description = "Minimal Linux SRUN campus network authentication service"
 license = "MIT"
@@ -23,7 +23,7 @@ serde_json = "1"
 sha1 = "0.10"
 socket2 = { version = "0.6", features = ["all"] }
 tempfile = "3"
-tokio = { version = "1", features = ["macros", "rt", "signal", "time", "net", "io-util", "process"] }
+tokio = { version = "1", features = ["macros", "rt", "signal", "time", "net", "process"] }
 toml = "0.8"
 unicode-width = "0.2"
 

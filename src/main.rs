@@ -47,8 +47,6 @@ enum Action {
     Run {
         #[arg(long, default_value = CONFIG_PATH)]
         config: PathBuf,
-        #[arg(long, default_value = state::STATE_DIR)]
-        state_dir: PathBuf,
     },
 }
 
@@ -145,9 +143,11 @@ async fn logout(controller: &Controller) -> Result<()> {
 }
 
 async fn run(args: Args) -> Result<()> {
-    let controller = Controller::default();
+    let controller = Controller;
     match args.command {
-        Some(Action::Run { config, state_dir }) => return daemon::run(&config, &state_dir).await,
+        Some(Action::Run { config }) => {
+            return daemon::run(&config, Path::new(state::STATE_DIR)).await;
+        }
         Some(Action::Status) => {
             println!("{}", controller.status().await?);
             return Ok(());

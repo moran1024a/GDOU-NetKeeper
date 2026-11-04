@@ -9,7 +9,7 @@ use std::{
 
 pub const STATE_DIR: &str = "/run/netkeeper";
 
-#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum Phase {
     Starting,
@@ -20,7 +20,7 @@ pub enum Phase {
     Stopped,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Deserialize, Serialize)]
 pub struct State {
     pub pid: u32,
     pub phase: Phase,

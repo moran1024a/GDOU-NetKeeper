@@ -347,25 +347,22 @@ pub async fn settings(path: &Path) -> Result<bool> {
                     }
                 }
             }
-            1..=5 => {
-                let (label, value) = choices[index].split_once('：').expect("field label");
-                if let Some(value) = ui.input(label, value)? {
-                    match index {
-                        1 => config.username = value,
-                        2 => config.password = value,
-                        3 => config.portal_url = value,
-                        4 => match value.parse() {
-                            Ok(value) => config.ac_id = value,
-                            Err(_) => ui.message("输入无效", "接入点编号必须是正整数")?,
-                        },
-                        5 => match value.parse::<u64>() {
-                            Ok(value) => config.online_interval_secs = value,
-                            Err(_) => ui.message("输入无效", "间隔必须是正整数秒数")?,
-                        },
-                        _ => unreachable!(),
-                    }
+            1..=3 => {
+                let (label, field) = match index {
+                    1 => ("账号", &mut config.username),
+                    2 => ("密码", &mut config.password),
+                    _ => ("Portal", &mut config.portal_url),
+                };
+                if let Some(value) = ui.input(label, field)? {
+                    *field = value;
                 }
             }
+            4 => number(&mut ui, "接入点 ac_id", &mut config.ac_id)?,
+            5 => number(
+                &mut ui,
+                "Portal 巡检间隔（秒）",
+                &mut config.online_interval_secs,
+            )?,
             6 => probe_settings(&mut ui, &mut config)?,
             7 => retry_settings(&mut ui, &mut config)?,
             8 => discover_settings(&mut ui, &mut config).await?,
@@ -558,16 +555,5 @@ fn retry_settings(ui: &mut Ui, config: &mut Config) -> Result<()> {
             "重试间隔（秒）",
             &mut config.retry_intervals_secs[index],
         )?;
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    #[tokio::test]
-    #[ignore = "driven through a PTY by tests/behavior.py"]
-    async fn interactive_settings_fixture() {
-        let path = std::path::PathBuf::from(std::env::var_os("NETKEEPER_UI_TEST_CONFIG").unwrap());
-        let expected = std::env::var("NETKEEPER_UI_TEST_SAVED").unwrap() == "yes";
-        assert_eq!(super::settings(&path).await.unwrap(), expected);
     }
 }

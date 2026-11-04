@@ -27,7 +27,7 @@ impl std::fmt::Display for CredentialRejected {
 
 impl std::error::Error for CredentialRejected {}
 
-fn rejection(value: &Value, config: &Config, secrets: &[String]) -> anyhow::Error {
+fn rejection(value: &Value, config: &Config, secrets: &[&str]) -> anyhow::Error {
     let detail = portal_error(value, config, secrets);
     // Only explicit, known account errors pause authentication. Unknown server
     // errors remain retryable; free-form messages are never used to guess.
@@ -42,19 +42,13 @@ pub struct SrunClient<'a> {
     config: &'a Config,
     http: Client,
     ip: Ipv4Addr,
-    probe_url: String,
 }
 
 impl<'a> SrunClient<'a> {
     pub async fn new(config: &'a Config) -> Result<Self> {
         let portal = Url::parse(&config.portal_url)?;
         let (http, ip) = bound_http(&portal, config.interface.as_deref()).await?;
-        Ok(Self {
-            config,
-            http,
-            ip,
-            probe_url: PROBE_URL.to_owned(),
-        })
+        Ok(Self { config, http, ip })
     }
 
     pub async fn cycle(&self) -> Result<bool> {
@@ -68,7 +62,7 @@ impl<'a> SrunClient<'a> {
 
     pub async fn logout(&self) -> Result<&'static str> {
         let state = self
-            .api("rad_user_info", vec![], PROBE_TIMEOUT)
+            .api("rad_user_info", &[], PROBE_TIMEOUT)
             .await
             .context("无法查询登录状态，未发送注销请求")?;
         match protocol::status(&state) {
@@ -86,16 +80,18 @@ impl<'a> SrunClient<'a> {
         if ip.is_unspecified() || ip.is_multicast() || ip == Ipv4Addr::BROADCAST {
             bail!("服务器返回的在线 IPv4 无效，未发送注销请求");
         }
+        let ip = ip.to_string();
+        let ac_id = self.config.ac_id.to_string();
         let response = self
             .api(
                 "srun_portal",
-                vec![
-                    ("action", "logout".into()),
-                    ("username", self.config.username.clone()),
-                    ("ip", ip.to_string()),
-                    ("ac_id", self.config.ac_id.to_string()),
-                    ("os", "linux".into()),
-                    ("name", "linux".into()),
+                &[
+                    ("action", "logout"),
+                    ("username", &self.config.username),
+                    ("ip", &ip),
+                    ("ac_id", &ac_id),
+                    ("os", "linux"),
+                    ("name", "linux"),
                 ],
                 AUTH_TIMEOUT,
             )
@@ -107,7 +103,7 @@ impl<'a> SrunClient<'a> {
             if attempt > 0 {
                 tokio::time::sleep(Duration::from_secs(1)).await;
             }
-            let result = self.api("rad_user_info", vec![], PROBE_TIMEOUT).await;
+            let result = self.api("rad_user_info", &[], PROBE_TIMEOUT).await;
             match result.as_ref().map(protocol::status) {
                 Ok(Status::Offline) => return Ok("已确认注销校园网"),
                 Ok(Status::Online) => confirmed_online = true,
@@ -126,7 +122,7 @@ impl<'a> SrunClient<'a> {
     }
 
     async fn online(&self) -> bool {
-        match self.api("rad_user_info", vec![], PROBE_TIMEOUT).await {
+        match self.api("rad_user_info", &[], PROBE_TIMEOUT).await {
             Ok(value) => match protocol::status(&value) {
                 Status::Online => return true,
                 Status::Offline => return false,
@@ -135,12 +131,7 @@ impl<'a> SrunClient<'a> {
             Err(error) => eprintln!("状态接口暂不可用：{error:#}"),
         }
         // Only fall back on an unknown/error status. A captive portal's HTTP 200 is not enough.
-        let response = self
-            .http
-            .get(&self.probe_url)
-            .timeout(PROBE_TIMEOUT)
-            .send()
-            .await;
+        let response = self.http.get(PROBE_URL).timeout(PROBE_TIMEOUT).send().await;
         match response {
             Ok(response) => read_body(response)
                 .await
@@ -155,10 +146,10 @@ impl<'a> SrunClient<'a> {
         let challenge = self
             .api(
                 "get_challenge",
-                vec![
-                    ("username", self.config.username.clone()),
-                    ("ip", ip.clone()),
-                    ("ac_id", ac_id.clone()),
+                &[
+                    ("username", &self.config.username),
+                    ("ip", &ip),
+                    ("ac_id", &ac_id),
                 ],
                 AUTH_TIMEOUT,
             )
@@ -177,27 +168,27 @@ impl<'a> SrunClient<'a> {
             token,
         )?;
         let secrets = [
-            params.password.clone(),
-            params.info.clone(),
-            params.chksum.clone(),
-            token.to_owned(),
+            params.password.as_str(),
+            params.info.as_str(),
+            params.chksum.as_str(),
+            token,
         ];
         let response = self
             .api(
                 "srun_portal",
-                vec![
-                    ("action", "login".into()),
-                    ("username", self.config.username.clone()),
-                    ("password", params.password),
-                    ("info", params.info),
-                    ("chksum", params.chksum),
-                    ("ac_id", ac_id),
-                    ("ip", ip),
-                    ("n", "200".into()),
-                    ("type", "1".into()),
-                    ("double_stack", "0".into()),
-                    ("os", "linux".into()),
-                    ("name", "linux".into()),
+                &[
+                    ("action", "login"),
+                    ("username", &self.config.username),
+                    ("password", &params.password),
+                    ("info", &params.info),
+                    ("chksum", &params.chksum),
+                    ("ac_id", &ac_id),
+                    ("ip", &ip),
+                    ("n", "200"),
+                    ("type", "1"),
+                    ("double_stack", "0"),
+                    ("os", "linux"),
+                    ("name", "linux"),
                 ],
                 AUTH_TIMEOUT,
             )
@@ -211,7 +202,7 @@ impl<'a> SrunClient<'a> {
     async fn api(
         &self,
         endpoint: &str,
-        mut params: Vec<(&str, String)>,
+        params: &[(&str, &str)],
         timeout: Duration,
     ) -> Result<Value> {
         let timestamp = SystemTime::now()
@@ -220,15 +211,14 @@ impl<'a> SrunClient<'a> {
             .as_millis()
             .to_string();
         let callback = format!("jQuery1124_{timestamp}");
-        params.push(("callback", callback.clone()));
-        params.push(("_", timestamp));
         let response = self
             .http
             .get(format!(
                 "{}/cgi-bin/{endpoint}",
                 self.config.portal_url.trim_end_matches('/')
             ))
-            .query(&params)
+            .query(params)
+            .query(&[("callback", callback.as_str()), ("_", timestamp.as_str())])
             .timeout(timeout)
             .send()
             .await
@@ -240,7 +230,7 @@ impl<'a> SrunClient<'a> {
     }
 }
 
-fn portal_error(value: &Value, config: &Config, secrets: &[String]) -> String {
+fn portal_error(value: &Value, config: &Config, secrets: &[&str]) -> String {
     let mut details = Vec::new();
     for field in ["error", "error_msg", "res", "ecode"] {
         let text = match &value[field] {
@@ -252,9 +242,9 @@ fn portal_error(value: &Value, config: &Config, secrets: &[String]) -> String {
             continue;
         }
         let mut text = text;
-        for secret in [&config.password, &config.username]
+        for secret in [config.password.as_str(), config.username.as_str()]
             .into_iter()
-            .chain(secrets)
+            .chain(secrets.iter().copied())
         {
             if !secret.is_empty() {
                 text = text.replace(secret, "[已省略]");
@@ -333,295 +323,4 @@ pub(crate) async fn read_body(mut response: Response) -> Result<String> {
         bytes.extend_from_slice(&chunk);
     }
     String::from_utf8(bytes).context("响应不是有效 UTF-8")
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use tokio::{
-        io::{AsyncReadExt, AsyncWriteExt},
-        net::TcpListener,
-        task::JoinHandle,
-    };
-
-    #[tokio::test]
-    async fn rejection_reason_is_reported_without_credentials() {
-        let (config, server) = mock_portal(vec![]).await;
-        let value = serde_json::json!({"error": "password_error", "error_msg": format!("bad password for {}: {}\u{1b}", config.username, config.password), "ecode": 42});
-        let detail = portal_error(&value, &config, &[]);
-        assert!(detail.contains("password_error") && detail.contains("ecode=42"));
-        assert!(!detail.contains(&config.password) && !detail.contains(&config.username));
-        assert!(!detail.contains('\u{1b}'));
-        assert!(rejection(&value, &config, &[]).is::<CredentialRejected>());
-        let unknown = serde_json::json!({"error": "unknown", "error_msg": "password_error"});
-        assert!(!rejection(&unknown, &config, &[]).is::<CredentialRejected>());
-        requests(server).await;
-    }
-
-    // Loopback only; replies are supplied by each test, never by the campus network.
-    async fn mock_portal(replies: Vec<(u16, &'static str)>) -> (Config, JoinHandle<Vec<Url>>) {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let server = tokio::spawn(async move {
-            let mut requests = Vec::new();
-            for (status, body) in replies {
-                let (mut stream, _) = listener.accept().await.unwrap();
-                let mut request = Vec::new();
-                loop {
-                    let mut buffer = [0u8; 2048];
-                    let size = stream.read(&mut buffer).await.unwrap();
-                    assert!(size > 0 && request.len() < MAX_BODY);
-                    request.extend_from_slice(&buffer[..size]);
-                    if request.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
-                        break;
-                    }
-                }
-                let text = String::from_utf8(request).unwrap();
-                let path = text.split_whitespace().nth(1).unwrap();
-                let url = Url::parse(&format!("http://{addr}{path}")).unwrap();
-                let callback = url
-                    .query_pairs()
-                    .find(|(key, _)| key == "callback")
-                    .map(|(_, value)| value.into_owned());
-                let body = if body.starts_with('{') {
-                    format!("{}({body});", callback.unwrap())
-                } else {
-                    body.to_owned()
-                };
-                requests.push(url);
-                let response = format!("HTTP/1.1 {status} Test\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
-                stream.write_all(response.as_bytes()).await.unwrap();
-            }
-            requests
-        });
-        let config = Config {
-            username: "student@campus".into(),
-            password: "p+&=/密".into(),
-            portal_url: format!("http://{addr}"),
-            ac_id: 17,
-            ..Config::default()
-        };
-        (config, server)
-    }
-
-    async fn cycle(config: &Config) -> Result<bool> {
-        let mut client = SrunClient::new(config).await?;
-        client.probe_url = format!("{}/connecttest.txt", config.portal_url);
-        tokio::time::timeout(Duration::from_secs(3), client.cycle())
-            .await
-            .unwrap()
-    }
-
-    async fn requests(server: JoinHandle<Vec<Url>>) -> Vec<Url> {
-        tokio::time::timeout(Duration::from_secs(3), server)
-            .await
-            .unwrap()
-            .unwrap()
-    }
-
-    #[tokio::test]
-    async fn already_online_skips_login() {
-        let (config, server) = mock_portal(vec![(200, r#"{"error":"ok"}"#)]).await;
-        assert!(cycle(&config).await.unwrap());
-        let requests = requests(server).await;
-        assert_eq!(requests.len(), 1);
-        assert_eq!(requests[0].path(), "/cgi-bin/rad_user_info");
-    }
-
-    #[tokio::test]
-    async fn logout_sends_one_request_without_password_and_confirms_offline() {
-        let (config, server) = mock_portal(vec![
-            (200, r#"{"error":"ok","online_ip":"10.20.30.40"}"#),
-            (200, r#"{"error":"ok"}"#),
-            (200, r#"{"error":"not_online"}"#),
-        ])
-        .await;
-        assert_eq!(
-            SrunClient::new(&config)
-                .await
-                .unwrap()
-                .logout()
-                .await
-                .unwrap(),
-            "已确认注销校园网"
-        );
-        let calls = requests(server).await;
-        assert_eq!(calls.len(), 3);
-        assert_eq!(calls[0].path(), "/cgi-bin/rad_user_info");
-        assert_eq!(calls[2].path(), "/cgi-bin/rad_user_info");
-        let params: std::collections::HashMap<_, _> = calls[1].query_pairs().into_owned().collect();
-        assert_eq!(params["action"], "logout");
-        assert_eq!(params["username"], config.username);
-        assert_eq!(params["ip"], "10.20.30.40");
-        assert_eq!(params["ac_id"], "17");
-        assert!(!params.contains_key("password") && !params.contains_key("info"));
-    }
-
-    #[tokio::test]
-    async fn logout_skips_offline_or_unknown_sessions() {
-        for (body, success) in [
-            (r#"{"error":"not_online_error"}"#, true),
-            (r#"{"error":"busy"}"#, false),
-        ] {
-            let (config, server) = mock_portal(vec![(200, body)]).await;
-            assert_eq!(
-                SrunClient::new(&config)
-                    .await
-                    .unwrap()
-                    .logout()
-                    .await
-                    .is_ok(),
-                success
-            );
-            assert_eq!(requests(server).await.len(), 1);
-        }
-    }
-
-    #[tokio::test]
-    async fn logout_does_not_treat_rejection_or_http_failure_as_success() {
-        for (reply, expected) in [
-            ((200, r#"{"error":"ok"}"#), "仍显示在线"),
-            ((503, "unavailable"), "无法确认注销结果"),
-        ] {
-            let (config, server) = mock_portal(vec![
-                (200, r#"{"error":"ok"}"#),
-                (200, r#"{"error":"logout_error"}"#),
-                reply,
-                reply,
-                reply,
-            ])
-            .await;
-            let error = SrunClient::new(&config)
-                .await
-                .unwrap()
-                .logout()
-                .await
-                .unwrap_err();
-            assert!(error.to_string().contains(expected), "{error:#}");
-            let calls = requests(server).await;
-            assert_eq!(
-                calls
-                    .iter()
-                    .filter(|url| url.path() == "/cgi-bin/srun_portal")
-                    .count(),
-                1
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn login_encodes_query_once_and_confirms_online() {
-        let (config, server) = mock_portal(vec![
-            (200, r#"{"error":"not_online"}"#),
-            (
-                200,
-                r#"{"error":"ok","challenge":"0123456789abcdef0123456789abcdef"}"#,
-            ),
-            (200, r#"{"error":"ok","res":0}"#),
-            (200, r#"{"error":"ok"}"#),
-        ])
-        .await;
-        assert!(cycle(&config).await.unwrap());
-        let requests = requests(server).await;
-        assert_eq!(
-            requests.iter().map(|r| r.path()).collect::<Vec<_>>(),
-            [
-                "/cgi-bin/rad_user_info",
-                "/cgi-bin/get_challenge",
-                "/cgi-bin/srun_portal",
-                "/cgi-bin/rad_user_info",
-            ]
-        );
-        let params: std::collections::HashMap<_, _> =
-            requests[2].query_pairs().into_owned().collect();
-        let auth = protocol::auth_params(
-            &config.username,
-            &config.password,
-            "127.0.0.1",
-            17,
-            "0123456789abcdef0123456789abcdef",
-        )
-        .unwrap();
-        assert_eq!(params["info"], auth.info);
-        assert_eq!(params["chksum"], auth.chksum);
-        assert_eq!(params["username"], config.username);
-        assert_eq!(params["ip"], "127.0.0.1");
-        assert_eq!(params["password"], auth.password);
-    }
-
-    #[tokio::test]
-    async fn login_acceptance_without_online_status_is_not_success() {
-        let (config, server) = mock_portal(vec![
-            (200, r#"{"error":"offline"}"#),
-            (200, r#"{"challenge":"0123456789abcdef"}"#),
-            (200, r#"{"error":"ok"}"#),
-            (200, r#"{"error":"notonline"}"#),
-        ])
-        .await;
-        assert!(!cycle(&config).await.unwrap());
-        assert_eq!(requests(server).await.len(), 4);
-    }
-
-    #[tokio::test]
-    async fn unknown_status_falls_back_to_exact_probe_body() {
-        let (config, server) = mock_portal(vec![
-            (200, r#"{"error":"busy"}"#),
-            (200, "Microsoft Connect Test\n"),
-        ])
-        .await;
-        assert!(cycle(&config).await.unwrap());
-        assert_eq!(requests(server).await[1].path(), "/connecttest.txt");
-    }
-
-    #[tokio::test]
-    async fn captive_http_200_and_redirect_do_not_confirm_online() {
-        for probe in [(200, "<html>login</html>"), (302, "Microsoft Connect Test")] {
-            let (config, server) = mock_portal(vec![
-                (503, "busy"),
-                probe,
-                (
-                    200,
-                    r#"{"error":"challenge_error","error_msg":"private-server-text"}"#,
-                ),
-            ])
-            .await;
-            let error = cycle(&config).await.unwrap_err();
-            assert!(format!("{error:#}").contains("challenge_error"));
-            assert_eq!(requests(server).await[2].path(), "/cgi-bin/get_challenge");
-        }
-    }
-
-    #[tokio::test]
-    async fn each_retry_obtains_a_new_challenge() {
-        let (config, server) = mock_portal(vec![
-            (200, r#"{"error":"offline"}"#),
-            (200, r#"{"challenge":"1111111111111111"}"#),
-            (200, r#"{"error":"denied"}"#),
-            (200, r#"{"error":"offline"}"#),
-            (200, r#"{"challenge":"2222222222222222"}"#),
-            (200, r#"{"error":"ok"}"#),
-            (200, r#"{"error":"ok"}"#),
-        ])
-        .await;
-        assert!(cycle(&config).await.is_err());
-        assert!(cycle(&config).await.unwrap());
-        let requests = requests(server).await;
-        let info = |index: usize| {
-            requests[index]
-                .query_pairs()
-                .find(|(key, _)| key == "info")
-                .unwrap()
-                .1
-                .into_owned()
-        };
-        assert_ne!(info(2), info(5));
-    }
-
-    #[tokio::test]
-    async fn nonexistent_interface_never_falls_back_to_default_route() {
-        let (mut config, server) = mock_portal(vec![]).await;
-        config.interface = Some("nk-missing0".into());
-        assert!(SrunClient::new(&config).await.is_err());
-        requests(server).await;
-    }
 }

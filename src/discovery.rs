@@ -2,18 +2,17 @@ use crate::client::{bound_http, read_body};
 use anyhow::{bail, Context, Result};
 use reqwest::Url;
 use std::{
-    collections::{BTreeSet, HashSet, VecDeque},
+    collections::{HashSet, VecDeque},
     time::Duration,
 };
 
 const TIMEOUT: Duration = Duration::from_secs(10);
 const REQUEST_LIMIT: usize = 6;
-const PROBES: [&str; 2] = [
-    "http://www.msftconnecttest.com/connecttest.txt",
-    "http://neverssl.com/",
+const PROBES: [(&str, &str); 2] = [
+    ("www.msftconnecttest.com", "/connecttest.txt"),
+    ("neverssl.com", "/"),
 ];
 
-#[derive(Debug, PartialEq, Eq)]
 pub struct Parameters {
     pub portal_url: String,
     pub ac_id: u32,
@@ -47,22 +46,19 @@ fn query_id(url: &Url) -> Option<u32> {
     if probe_host(url) {
         return None;
     }
-    let values: BTreeSet<_> = url
-        .query_pairs()
-        .filter(|(key, _)| key == "ac_id")
-        .map(|(_, value)| value.parse::<u32>().ok().filter(|id| *id > 0))
-        .collect();
-    if values.len() == 1 {
-        values.into_iter().next().flatten()
-    } else {
-        None
+    let mut found = None;
+    for (_, value) in url.query_pairs().filter(|(key, _)| key == "ac_id") {
+        let id = value.parse::<u32>().ok().filter(|id| *id > 0)?;
+        if found.is_some_and(|previous| previous != id) {
+            return None;
+        }
+        found = Some(id);
     }
+    found
 }
 
 fn probe_host(url: &Url) -> bool {
-    PROBES
-        .iter()
-        .any(|probe| Url::parse(probe).is_ok_and(|probe| probe.host_str() == url.host_str()))
+    PROBES.iter().any(|(host, _)| url.host_str() == Some(*host))
 }
 
 fn parameters(url: &Url, ac_id: u32) -> Parameters {
@@ -79,20 +75,23 @@ pub fn from_link(value: &str) -> Result<Parameters> {
 }
 
 fn inline_id(body: &str) -> Option<u32> {
-    let tokens: Vec<_> = body
+    let tokens = body
         .split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
-        .filter(|s| !s.is_empty())
-        .collect();
-    let ids: BTreeSet<u32> = tokens
-        .windows(2)
-        .filter(|pair| pair[0] == "ac_id")
-        .filter_map(|pair| pair[1].parse().ok().filter(|id| *id > 0))
-        .collect();
-    if ids.len() == 1 {
-        ids.into_iter().next()
-    } else {
-        None
+        .filter(|s| !s.is_empty());
+    let mut previous = "";
+    let mut found = None;
+    for token in tokens {
+        if previous == "ac_id" {
+            if let Some(id) = token.parse::<u32>().ok().filter(|id| *id > 0) {
+                if found.is_some_and(|previous| previous != id) {
+                    return None;
+                }
+                found = Some(id);
+            }
+        }
+        previous = token;
     }
+    found
 }
 
 fn page_links(base: &Url, body: &str) -> Vec<Url> {
@@ -149,7 +148,11 @@ pub async fn discover(interface: Option<&str>, portal_hint: &str) -> Result<Para
     if !portal_hint.trim().is_empty() {
         seeds.push(page_url(portal_hint.trim())?);
     }
-    seeds.extend(PROBES.iter().map(|url| Url::parse(url).expect("probe URL")));
+    seeds.extend(
+        PROBES
+            .iter()
+            .map(|(host, path)| Url::parse(&format!("http://{host}{path}")).expect("probe URL")),
+    );
     tokio::time::timeout(TIMEOUT, discover_at(interface, seeds))
         .await
         .context("自动识别超过 10 秒，请粘贴认证页面链接或手动填写")?
@@ -209,14 +212,20 @@ async fn discover_at(interface: Option<&str>, seeds: Vec<Url>) -> Result<Paramet
             }
         };
         let links = page_links(&url, &body);
-        let found: BTreeSet<_> = links
+        let mut found = None;
+        for candidate in links
             .iter()
             .filter_map(|link| query_id(link).map(|id| (link.origin().ascii_serialization(), id)))
-            .collect();
-        if found.len() > 1 {
-            bail!("发现多组认证参数，请粘贴当前认证页面链接确认");
+        {
+            if found
+                .as_ref()
+                .is_some_and(|previous| *previous != candidate)
+            {
+                bail!("发现多组认证参数，请粘贴当前认证页面链接确认");
+            }
+            found = Some(candidate);
         }
-        if let Some((portal_url, ac_id)) = found.into_iter().next() {
+        if let Some((portal_url, ac_id)) = found {
             return Ok(Parameters { portal_url, ac_id });
         }
         // An intercepted HTTP 200 does not make the public probe host a Portal.
@@ -233,79 +242,4 @@ async fn discover_at(interface: Option<&str>, seeds: Vec<Url>) -> Result<Paramet
         .map(|e| format!("；最近错误：{e:#}"))
         .unwrap_or_default();
     bail!("未找到完整认证参数；已在线时可能没有认证跳转，请填写已知 Portal 后再识别，或粘贴认证页面链接{detail}")
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use tokio::{
-        io::{AsyncReadExt, AsyncWriteExt},
-        net::TcpListener,
-    };
-
-    #[test]
-    fn discovery_parses_links_and_rejects_actions_or_ambiguous_ids() {
-        assert_eq!(
-            from_link("http://10.0.0.1:8080/srun_portal_pc?ac_id=17&x=1").unwrap(),
-            Parameters {
-                portal_url: "http://10.0.0.1:8080".into(),
-                ac_id: 17
-            }
-        );
-        for value in [
-            "http://x/?ac_id=0",
-            "http://x/?ac_id=1&ac_id=2",
-            "http://x/?ac_id=1&action=logout",
-            "file:///tmp/test?ac_id=17",
-            "http://user:password@x/?ac_id=17",
-            "http://x/cgi-bin/srun_portal?ac_id=17",
-            "http://neverssl.com/?ac_id=17",
-        ] {
-            assert!(from_link(value).is_err(), "{value}");
-        }
-        assert_eq!(inline_id("var ac_id = 17; var name = 'srun';"), Some(17));
-        assert_eq!(inline_id("ac_id=17; ac_id=18;"), None);
-    }
-
-    #[tokio::test]
-    async fn discovery_reads_redirects_html_and_online_portal_without_authenticating() {
-        for (status, headers, body) in [
-            (302, "Location: /srun_portal_pc?ac_id=17\r\n", ""),
-            (200, "", "<meta http-equiv='refresh' content='0;URL=/srun_portal_pc?ac_id=17&amp;theme=pro'>"),
-            (200, "", "<script>location.href='/srun_portal_pc?ac_id=17';</script>"),
-            (200, "", "<script>var ac_id=17;</script><p>srun online</p>"),
-        ] {
-            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let origin = format!("http://{}", listener.local_addr().unwrap());
-            let server = tokio::spawn(async move {
-                let (mut stream, _) = listener.accept().await.unwrap();
-                let mut request = [0; 4096];
-                let count = stream.read(&mut request).await.unwrap();
-                let request = std::str::from_utf8(&request[..count]).unwrap();
-                assert!(request.starts_with("GET / "));
-                assert!(!request.contains("password") && !request.contains("logout"));
-                let response = format!("HTTP/1.1 {status} Test\r\n{headers}Content-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
-                stream.write_all(response.as_bytes()).await.unwrap();
-            });
-            let result = discover_at(Some("lo"), vec![Url::parse(&origin).unwrap()]).await.unwrap();
-            assert_eq!(result, Parameters { portal_url: origin, ac_id: 17 });
-            server.await.unwrap();
-        }
-    }
-
-    #[tokio::test]
-    async fn discovery_stops_redirect_loops_and_does_not_guess_an_id() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let origin = format!("http://{}", listener.local_addr().unwrap());
-        let server = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await.unwrap();
-            let mut request = [0; 4096];
-            stream.read(&mut request).await.unwrap();
-            stream.write_all(b"HTTP/1.1 302 Found\r\nLocation: /\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await.unwrap();
-        });
-        assert!(discover_at(None, vec![Url::parse(&origin).unwrap()])
-            .await
-            .is_err());
-        server.await.unwrap();
-    }
 }

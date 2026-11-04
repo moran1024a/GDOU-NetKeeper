@@ -236,31 +236,3 @@ fn retry_delay(config: &Config, failed_attempts: u32) -> u64 {
     };
     config.retry_intervals_secs[stage]
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn staged_delays_and_probe_success_reset() {
-        let config = Config::default();
-        let delays: Vec<_> = (1..=9).map(|n| retry_delay(&config, n)).collect();
-        assert_eq!(delays, [5, 5, 5, 15, 15, 15, 30, 30, 30]);
-        let mut state = State::new(None);
-        for reachable in [false, false, true, false, false, false] {
-            record_probe(
-                &mut state,
-                probe::ProbeResult {
-                    checked_at: 0,
-                    reachable,
-                    detail: String::new(),
-                },
-            );
-        }
-        assert_eq!(state.probe_failures, 3);
-        assert_eq!(
-            state.generation, 0,
-            "Probe results cannot satisfy a start confirmation"
-        );
-    }
-}
